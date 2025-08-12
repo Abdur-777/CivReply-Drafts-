@@ -357,13 +357,3 @@ def render_drafts_ui(
                         st.error("Could not send draft. Check permissions (Mail.Send) and retry.")
 
     st.caption("Admin tip: tune the GREEN/AMBER/RED heuristics in drafts_module.py and wire a proper get_answer_fn for grounded replies.")
-
-
-
-
-
-
-
-Sources
-
-Ask ChatGPT
