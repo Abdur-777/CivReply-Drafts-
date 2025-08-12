@@ -1,6 +1,5 @@
-# ingest.py — build FAISS indexes for VIC councils from councils.json
-import os, json, re, time, faiss, requests, tiktoken
-import numpy as np
+# ingest.py — robust sitemap discovery + FAISS indexing for VIC councils
+import os, json, re, time, gzip, io, argparse, faiss, requests, tiktoken, numpy as np
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
@@ -12,76 +11,124 @@ ENC = tiktoken.get_encoding("cl100k_base")
 IDX_DIR = "indexes"
 os.makedirs(IDX_DIR, exist_ok=True)
 
-# Keywords we care about (waste, permits, rates, hours, etc.)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# pages we care about
 KEEP_PATTERNS = [
     "waste", "recycling", "bin", "hard-rubbish", "hardrubbish", "green-waste",
     "parking", "permit", "permits", "rates", "fees", "payments",
     "contact", "customer", "libraries", "library",
     "animal", "pets", "dogs", "cats",
     "building", "planning", "roads", "footpath",
-    "events", "opening-hours", "hours", "collection", "book", "booking", "transfer-station", "tip"
+    "events", "opening-hours", "hours", "collection", "book", "booking",
+    "transfer-station", "tip"
 ]
 
-# Fallback guesses if sitemap is thin
+# generic fallbacks if sitemaps are tricky
 FALLBACK_PATHS = [
-    "/services", "/contact-us", "/contact", "/rates", "/waste-recycling", "/waste-and-recycling",
-    "/parking-permits", "/parking/permits", "/libraries", "/building-permits", "/planning-building"
+    "/services", "/contact-us", "/contact",
+    "/rates", "/waste-recycling", "/waste-and-recycling",
+    "/parking-permits", "/parking/permits", "/libraries",
+    "/building-permits", "/planning-building"
 ]
 
 def good(url: str) -> bool:
     u = url.lower()
     return any(p in u for p in KEEP_PATTERNS)
 
-def fetch_sitemap_urls(base: str, limit=120) -> list[str]:
-    urls = []
-    tried = set()
-    candidates = [f"{base.rstrip('/')}/sitemap.xml", f"{base.rstrip('/')}/sitemap_index.xml"]
-    for sm in candidates:
-        if sm in tried: continue
-        tried.add(sm)
+def fetch(url: str):
+    return requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+
+def sitemap_candidates(base: str):
+    """Yield likely sitemap URLs (handles www + robots.txt)."""
+    base = base.rstrip("/")
+    parsed = urlparse(base)
+    schemes_hosts = {f"{parsed.scheme}://{parsed.netloc}"}
+    if not parsed.netloc.startswith("www."):
+        schemes_hosts.add(f"{parsed.scheme}://www.{parsed.netloc}")
+
+    paths = [
+        "sitemap.xml", "sitemap_index.xml", "sitemapindex.xml",
+        "sitemap/sitemap.xml", "sitemap/sitemap_index.xml",
+        "sitemaps/sitemap.xml", "sitemaps/sitemap_index.xml",
+        "sitemap-1.xml"
+    ]
+    for sh in schemes_hosts:
+        for p in paths:
+            yield f"{sh}/{p}"
+
+    # robots.txt → Sitemap: lines
+    for sh in schemes_hosts:
         try:
-            r = requests.get(sm, timeout=20)
-            if r.status_code != 200 or not r.text.strip():
-                continue
-            root = ET.fromstring(r.text)
-            # sitemapindex or urlset
-            if root.tag.endswith("sitemapindex"):
-                for node in root.iter():
-                    if node.tag.endswith("loc"):
-                        loc = node.text.strip()
-                        if loc and loc not in tried:
-                            tried.add(loc)
-                            try:
-                                rr = requests.get(loc, timeout=20)
-                                if rr.status_code == 200:
-                                    rs = ET.fromstring(rr.text)
-                                    for u in rs.iter():
-                                        if u.tag.endswith("loc"):
-                                            urls.append(u.text.strip())
-                            except Exception:
-                                pass
-            else:
-                for node in root.iter():
-                    if node.tag.endswith("loc"):
-                        urls.append(node.text.strip())
+            r = fetch(f"{sh}/robots.txt")
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        url = line.split(":", 1)[1].strip()
+                        if url:
+                            yield url
         except Exception:
-            continue
-    # fallback guesses
+            pass
+
+def iter_sitemap_urls(sm_url: str):
+    """Read a (possibly gzipped) sitemap or sitemap index and yield <loc> URLs."""
+    try:
+        r = fetch(sm_url)
+        if r.status_code != 200 or not r.content:
+            return
+        data = r.content
+        if sm_url.endswith(".gz"):
+            data = gzip.decompress(data)
+        root = ET.fromstring(data)
+        if root.tag.endswith("sitemapindex"):
+            for node in root.iter():
+                if node.tag.endswith("loc") and node.text:
+                    yield from iter_sitemap_urls(node.text.strip())
+        else:
+            for node in root.iter():
+                if node.tag.endswith("loc") and node.text:
+                    yield node.text.strip()
+    except Exception:
+        return
+
+def discover_urls(base: str, limit=120) -> list[str]:
+    """Find candidate content URLs via sitemaps; fall back to guessed paths."""
+    urls = []
+
+    # 1) sitemaps (incl. robots.txt, gz, www)
+    seen = set()
+    for cand in sitemap_candidates(base):
+        for u in iter_sitemap_urls(cand):
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+                if len(urls) >= limit:
+                    break
+        if len(urls) >= limit:
+            break
+
+    # 2) fallbacks if sitemap didn’t yield anything useful
     if not urls:
         for path in FALLBACK_PATHS:
-            url = base.rstrip("/") + path
+            u = base.rstrip("/") + path
             try:
-                rr = requests.get(url, timeout=10)
+                rr = fetch(u)
                 if rr.status_code == 200:
-                    urls.append(url)
+                    urls.append(u)
             except Exception:
-                continue
-    # same host only & filter by patterns
+                pass
+
+    # keep same host + pattern filter + dedupe
     host = urlparse(base).netloc
     urls = [u for u in urls if urlparse(u).netloc.endswith(host)]
     urls = [u for u in urls if good(u)]
-    # dedupe + cap
-    seen, deduped = set(), []
+    deduped = []
+    seen = set()
     for u in urls:
         if u in seen: continue
         seen.add(u); deduped.append(u)
@@ -89,12 +136,11 @@ def fetch_sitemap_urls(base: str, limit=120) -> list[str]:
     return deduped
 
 def fetch_clean(url: str) -> tuple[str, str]:
-    r = requests.get(url, timeout=25)
+    r = fetch(url)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     title = (soup.title.string if soup.title else url).strip()
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
+    for tag in soup(["script", "style", "noscript", "svg"]): tag.decompose()
     text = re.sub(r"\s+", " ", soup.get_text(separator=" ").strip())
     return title, text
 
@@ -112,9 +158,9 @@ def embed_texts(client: OpenAI, chunks: list[str]):
 
 def build_for(name: str, base_url: str):
     print(f"• {name}: discovering pages from {base_url}")
-    urls = fetch_sitemap_urls(base_url)
+    urls = discover_urls(base_url)
     if not urls:
-        print("  (!) No URLs discovered — check domain.")
+        print("  (!) No URLs discovered — check domain or adjust KEEP_PATTERNS.")
         return
     print(f"  found {len(urls)} URLs; fetching & chunking…")
 
@@ -138,19 +184,27 @@ def build_for(name: str, base_url: str):
     index = faiss.IndexFlatIP(DIM)
     index.add(X)
 
-    os.makedirs(IDX_DIR, exist_ok=True)
     faiss.write_index(index, f"{IDX_DIR}/{name}.faiss")
     with open(f"{IDX_DIR}/{name}.jsonl", "w") as f:
         for d, m in zip(docs, metas):
             f.write(json.dumps({"text": d, **m}) + "\n")
-    print(f"  ✓ Built {name}: {len(docs)} chunks, {len(urls)} pages")
+    print(f"  ✓ Built {name}: {len(docs)} chunks from {len(urls)} pages")
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", help="Comma-separated council names to build", default="")
+    args = ap.parse_args()
+
     data = json.load(open("councils.json"))
+    names = list(data.keys())
+    if args.only:
+        wanted = {n.strip() for n in args.only.split(",")}
+        names = [n for n in names if n in wanted]
+
     t0 = time.time()
-    for name, base in data.items():
+    for name in names:
         try:
-            build_for(name, base)
+            build_for(name, data[name])
         except Exception as e:
             print("ERROR", name, e)
     print(f"Done in {int(time.time()-t0)}s")
