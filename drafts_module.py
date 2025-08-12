@@ -1,5 +1,5 @@
 """
-drafts_module.py — Microsoft Graph + Streamlit (components.html fix)
+drafts_module.py — Microsoft Graph + Streamlit (components.html variant)
 
 Drop-in module that lets you:
 1) Paste an inbound email and generate a grounded reply draft with citations.
@@ -17,16 +17,6 @@ ENV VARS REQUIRED (for Outlook mode):
 AZURE APP PERMISSIONS (Application permissions, admin consent):
 - Mail.ReadWrite   # read inbox and create/update drafts
 - Mail.Send        # send a draft when auto-send is enabled
-
-HOW TO USE INSIDE YOUR Streamlit app.py:
--------------------------------------------------
-from drafts_module import render_drafts_ui
-render_drafts_ui(get_answer_fn=my_retriever)  # my_retriever(email_text, council) -> (html, citations_list)
-
-Notes:
-- This module doesn't assume any specific vector DB. Just give it a function
-  that returns (HTML_reply, citations_list["Title | URL | Snippet"]).
-- "Green/Amber/Red" gating uses simple heuristics; tune to your policies.
 """
 
 from __future__ import annotations
@@ -38,7 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components  # use components.html instead of st.components.v1
+import streamlit.components.v1 as components  # use components.html
 
 # ===============
 # Graph Client
@@ -233,10 +223,7 @@ def build_cited_reply(
     council_name: str,
     get_answer_fn: Optional[Callable[[str, str], Tuple[str, List[str]]]] = None,
 ) -> Tuple[str, List[str]]:
-    """Build an HTML reply and citations list using provided retriever.
-    get_answer_fn should return (html_reply_body, citations_list[str]).
-    If not provided, we use a default generic reply.
-    """
+    """Build an HTML reply and citations list using provided retriever."""
     try:
         if get_answer_fn:
             html_body, citations = get_answer_fn(email_text, council_name)
@@ -325,8 +312,8 @@ def render_drafts_ui(
 
         st.markdown("**Draft preview (HTML)**")
         components.html(
-            f"<div style='font-family:sans-serif; padding:12px; border:1px solid #ddd; border-radius:12px'>{html_body}</div>",
-            height=420,
+            f"<div style='font-family:sans-serif; padding:4px'>{html_body}</div>",
+            height=480,
             scrolling=True,
         )
 
