@@ -1,5 +1,5 @@
 """
-Drafts Module — Microsoft Graph + Streamlit
+drafts_module.py — Microsoft Graph + Streamlit (components.html fix)
 
 Drop-in module that lets you:
 1) Paste an inbound email and generate a grounded reply draft with citations.
@@ -7,27 +7,21 @@ Drop-in module that lets you:
    pick one, and create a **reply draft** in Outlook (Drafts folder). Optionally send
    automatically for low-risk ("Green") categories.
 
-ENV VARS REQUIRED (set in your hosting env):
+ENV VARS REQUIRED (for Outlook mode):
 - GRAPH_TENANT_ID
 - GRAPH_CLIENT_ID
 - GRAPH_CLIENT_SECRET
-- GRAPH_MAILBOX_ADDRESS        # e.g. "info@council.vic.gov.au" or shared mailbox address
+- GRAPH_MAILBOX_ADDRESS        # e.g. "civreply@yourtenant.onmicrosoft.com"
 - (Optional) OPENAI_API_KEY    # if you wire to your retriever/LLM
 
 AZURE APP PERMISSIONS (Application permissions, admin consent):
 - Mail.ReadWrite   # read inbox and create/update drafts
 - Mail.Send        # send a draft when auto-send is enabled
 
-You may also use Delegated permissions for pilots (user login):
-- Mail.ReadWrite, Mail.Send (and Mail.ReadWrite.Shared for shared mailboxes)
-But this module is written for **app-only** (client credentials) for simplicity.
-
 HOW TO USE INSIDE YOUR Streamlit app.py:
 -------------------------------------------------
 from drafts_module import render_drafts_ui
 render_drafts_ui(get_answer_fn=my_retriever)  # my_retriever(email_text, council) -> (html, citations_list)
-
-If you don't pass get_answer_fn, the module returns a neutral placeholder draft.
 
 Notes:
 - This module doesn't assume any specific vector DB. Just give it a function
@@ -44,37 +38,49 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components  # use components.html instead of st.components.v1
 
 # ===============
 # Graph Client
 # ===============
 
 class GraphClient:
-    def __init__(self,
-                 tenant_id: Optional[str] = None,
-                 client_id: Optional[str] = None,
-                 client_secret: Optional[str] = None,
-                 mailbox_address: Optional[str] = None):
+    def __init__(
+        self,
+        tenant_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        mailbox_address: Optional[str] = None,
+    ):
         self.tenant_id = tenant_id or os.getenv("GRAPH_TENANT_ID")
         self.client_id = client_id or os.getenv("GRAPH_CLIENT_ID")
         self.client_secret = client_secret or os.getenv("GRAPH_CLIENT_SECRET")
         self.mailbox_address = mailbox_address or os.getenv("GRAPH_MAILBOX_ADDRESS")
         self.token: Optional[str] = None
 
-        missing = [k for k, v in {
-            'GRAPH_TENANT_ID': self.tenant_id,
-            'GRAPH_CLIENT_ID': self.client_id,
-            'GRAPH_CLIENT_SECRET': self.client_secret,
-            'GRAPH_MAILBOX_ADDRESS': self.mailbox_address,
-        }.items() if not v]
+        missing = [
+            k
+            for k, v in {
+                "GRAPH_TENANT_ID": self.tenant_id,
+                "GRAPH_CLIENT_ID": self.client_id,
+                "GRAPH_CLIENT_SECRET": self.client_secret,
+                "GRAPH_MAILBOX_ADDRESS": self.mailbox_address,
+            }.items()
+            if not v
+        ]
         self.enabled = len(missing) == 0
         if not self.enabled:
-            st.info("Graph not configured (missing: %s). Paste-mode still works." % ", ".join(missing))
+            st.info(
+                "Graph not configured (missing: %s). Paste-mode still works."
+                % ", ".join(missing)
+            )
 
     def _acquire_token(self) -> Optional[str]:
         """Acquire app-only token using client credentials."""
         try:
-            token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+            token_url = (
+                f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+            )
             data = {
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
@@ -95,10 +101,7 @@ class GraphClient:
     def _headers(self) -> Dict[str, str]:
         if not self.token:
             self._acquire_token()
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
+        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
     def list_inbox(self, top: int = 25) -> List[Dict]:
         if not self.enabled:
@@ -111,7 +114,7 @@ class GraphClient:
         if not r.ok:
             st.error(f"Graph list_inbox failed: {r.status_code} {r.text[:300]}")
             return []
-        return r.json().get('value', [])
+        return r.json().get("value", [])
 
     def get_message(self, message_id: str) -> Optional[Dict]:
         if not self.enabled:
@@ -123,7 +126,9 @@ class GraphClient:
             return None
         return r.json()
 
-    def create_reply_draft(self, message_id: str, reply_html: str, comment: Optional[str] = None) -> Optional[str]:
+    def create_reply_draft(
+        self, message_id: str, reply_html: str, comment: Optional[str] = None
+    ) -> Optional[str]:
         """Create a reply draft for a specific message, then patch in our HTML body.
         Returns new draft message id on success.
         """
@@ -137,18 +142,13 @@ class GraphClient:
             st.error(f"Graph createReply failed: {r.status_code} {r.text[:300]}")
             return None
         draft = r.json()
-        draft_id = draft.get('id')
+        draft_id = draft.get("id")
         if not draft_id:
             st.error("Graph createReply returned no draft id.")
             return None
         # 2) patch the body content to our generated HTML
         patch_url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/messages/{draft_id}"
-        patch_body = {
-            "body": {
-                "contentType": "HTML",
-                "content": reply_html
-            }
-        }
+        patch_body = {"body": {"contentType": "HTML", "content": reply_html}}
         r2 = requests.patch(patch_url, headers=self._headers(), data=json.dumps(patch_body), timeout=20)
         if not r2.ok:
             st.error(f"Graph patch draft failed: {r2.status_code} {r2.text[:300]}")
@@ -186,8 +186,8 @@ RED_TRIGGERS = [
 ]
 
 PII_PATTERNS = [
-    re.compile(r"\b\d{8,}\b"),            # long ids/account numbers
-    re.compile(r"\b\+?\d{9,15}\b"),      # phone numbers
+    re.compile(r"\b\d{8,}\b"),      # long ids/account numbers
+    re.compile(r"\b\+?\d{9,15}\b"), # phone numbers
 ]
 
 def classify_risk(text: str) -> Tuple[str, List[str]]:
@@ -202,7 +202,6 @@ def classify_risk(text: str) -> Tuple[str, List[str]]:
     if any(p.search(t) for p in PII_PATTERNS):
         risk = "AMBER" if risk == "GREEN" else risk
         reasons.append("PII detected")
-    # Default to GREEN if none matched
     if not reasons:
         reasons.append("No risk triggers detected")
     return risk, reasons
@@ -218,9 +217,7 @@ def default_reply(email_text: str, council_name: str, citations: Optional[List[s
     cites = citations or [
         "General services | https://www.wyndham.vic.gov.au/services | Overview",
     ]
-    cite_html = "".join(
-        f"<li>{html.escape(c)}</li>" for c in cites
-    )
+    cite_html = "".join(f"<li>{html.escape(c)}</li>" for c in cites)
     footer = (
         "<p>Kind regards,<br/>Customer Service Team</p>"
         "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
@@ -247,7 +244,6 @@ def build_cited_reply(
                 html_body = str(html_body)
             if citations is None:
                 citations = []
-            # Always append review note
             html_body += "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
             return html_body, citations
         else:
@@ -291,20 +287,20 @@ def render_drafts_ui(
         if not msgs:
             st.info("No messages found or Graph not authorized.")
             st.stop()
-        # Build options list
         options = [
-            f"{i+1:02d}. {m.get('receivedDateTime','')[:19]} | {m.get('from',{}).get('emailAddress',{}).get('address','')} | {m.get('subject','')}"
+            f"{i+1:02d}. {m.get('receivedDateTime','')[:19]} | "
+            f"{m.get('from',{}).get('emailAddress',{}).get('address','')} | "
+            f"{m.get('subject','')}"
             for i, m in enumerate(msgs)
         ]
         choice = st.selectbox("Select an email", options)
         idx = options.index(choice)
         selected_message = msgs[idx]
-        mid = selected_message['id']
+        mid = selected_message["id"]
         full = graph.get_message(mid)
         if full:
-            # Prefer text extraction from HTML body
-            body = full.get('body', {}).get('content', '') or ''
-            stripped = re.sub('<[^<]+?>', '', body)
+            body_html = full.get("body", {}).get("content", "") or ""
+            stripped = re.sub("<[^<]+?>", "", body_html)
             original_text = stripped
             with st.expander("Original message (preview)", expanded=False):
                 st.text_area("", original_text, height=160)
@@ -326,11 +322,14 @@ def render_drafts_ui(
         st.write(f"Risk level: **{risk}** — {', '.join(reasons)}")
 
         html_body, citations = build_cited_reply(original_text, council_name, get_answer_fn)
+
         st.markdown("**Draft preview (HTML)**")
-        st.components.v1.html(
+        components.html(
             f"<div style='font-family:sans-serif; padding:12px; border:1px solid #ddd; border-radius:12px'>{html_body}</div>",
-            height=420, scrolling=True
+            height=420,
+            scrolling=True,
         )
+
         if citations:
             st.markdown("**Citations**")
             for c in citations:
@@ -339,21 +338,31 @@ def render_drafts_ui(
         # Actions
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.download_button("⬇️ Download .html", data=html_body.encode('utf-8'),
-                               file_name="reply_draft.html", mime="text/html")
+            st.download_button(
+                "⬇️ Download .html",
+                data=html_body.encode("utf-8"),
+                file_name="reply_draft.html",
+                mime="text/html",
+            )
         with col2:
             if graph.enabled and selected_message:
                 if st.button("📥 Create Outlook Draft"):
-                    did = graph.create_reply_draft(selected_message['id'], html_body, comment="Auto-drafted reply")
+                    did = graph.create_reply_draft(
+                        selected_message["id"], html_body, comment="Auto-drafted reply"
+                    )
                     if did:
                         st.success(f"Draft created in Outlook. (id: {did[:12]}…)")
         with col3:
             if graph.enabled and selected_message and risk == "GREEN":
                 if st.button("✅ Auto-send (GREEN only)"):
-                    did = graph.create_reply_draft(selected_message['id'], html_body, comment="Auto-drafted reply")
+                    did = graph.create_reply_draft(
+                        selected_message["id"], html_body, comment="Auto-drafted reply"
+                    )
                     if did and graph.send_draft(did):
                         st.success("Draft sent ✔️ (saved in Sent Items)")
                     else:
                         st.error("Could not send draft. Check permissions (Mail.Send) and retry.")
 
-    st.caption("Admin tip: tune the GREEN/AMBER/RED heuristics in drafts_module.py and wire a proper get_answer_fn for grounded replies.")
+    st.caption(
+        "Admin tip: tune the GREEN/AMBER/RED heuristics in drafts_module.py and wire a proper get_answer_fn for grounded replies."
+    )
