@@ -1,268 +1,269 @@
-# worker_autoreply.py — Render Worker for CivReply
-# Polls Outlook (Microsoft Graph) for unread messages and replies using
-# retriever_catalog.answer(). Supports three auto-send modes:
-#   AUTO_SEND_MODE = "green"  -> send only if single GREEN topic (default if AUTO_SEND_GREEN=1)
-#   AUTO_SEND_MODE = "always" -> send everything
-#   AUTO_SEND_MODE = "off"    -> never auto-send (only draft)
-#
-# Required Azure Graph (Application) permissions (admin-consented):
-#   - Mail.ReadWrite
-#   - Mail.Send
-#
-# Env vars:
-#   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, GRAPH_MAILBOX_ADDRESS
-#   COUNCIL_NAME="Wyndham City Council"
-#   POLL_SECONDS=45
-#   AUTO_SEND_MODE=green|always|off
-#   (legacy) AUTO_SEND_GREEN=0|1  # if AUTO_SEND_MODE not set, 1 -> green, 0 -> off
-#   GREEN_TOPICS="find_bin_day,book_hard_waste,bin_requests,rates_pay,parking_fines_pay,disability_parking,libraries,contact"
-#   HEADER_AUTO="Automated council reply — sourced from official Wyndham pages"
+# worker_autoreply.py
+# Polls Microsoft Graph for unread emails and auto-replies using your retriever.
 
-import os
-import time
-import json
-import re
-import html
+import os, time, json, re, traceback
 import requests
-from bs4 import BeautifulSoup
+from datetime import datetime, timezone
 
-import retriever_catalog as rc  # your link-grounded answerer
+# ====== ENV ======
+TENANT_ID         = os.environ.get("GRAPH_TENANT_ID", "")
+CLIENT_ID         = os.environ.get("GRAPH_CLIENT_ID", "")
+CLIENT_SECRET     = os.environ.get("GRAPH_CLIENT_SECRET", "")
+MAILBOX_ADDRESS   = os.environ.get("GRAPH_MAILBOX_ADDRESS", "")   # e.g. "wyndham-auto@yourdomain.com"
+AUTO_SEND_GREEN   = os.environ.get("AUTO_SEND_GREEN", "1") == "1" # "1" to auto-send, else drafts
+GREEN_TOPICS_ENV  = os.environ.get("GREEN_TOPICS", "waste,rates,libraries,animals,opening hours,general info")
+POLL_SECONDS      = int(os.environ.get("POLL_SECONDS", "30"))
+FROM_DISPLAY_NAME = os.environ.get("REPLY_FROM_NAME", "Wyndham Information Assistant")
+REPLY_SIGNATURE   = os.environ.get("REPLY_SIGNATURE", "—\nWyndham Information Assistant\n(This is an automated reply)")
 
-# ------------ Configuration ------------
-TENANT = os.environ["GRAPH_TENANT_ID"]
-CLIENT_ID = os.environ["GRAPH_CLIENT_ID"]
-CLIENT_SECRET = os.environ["GRAPH_CLIENT_SECRET"]
-MAILBOX = os.environ["GRAPH_MAILBOX_ADDRESS"]
+# Optional labeling/categories on the original message
+CATEGORY_REPLIED  = os.environ.get("CATEGORY_REPLIED", "AutoReplied")
+CATEGORY_NEEDSREV = os.environ.get("CATEGORY_NEEDS_REVIEW", "Needs review")
 
-COUNCIL_NAME = os.getenv("COUNCIL_NAME", "Wyndham City Council")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "45"))
-
-AUTO_SEND_MODE = os.getenv("AUTO_SEND_MODE")
-if not AUTO_SEND_MODE:
-    # Back-compat with earlier env
-    AUTO_SEND_MODE = "green" if os.getenv("AUTO_SEND_GREEN", "0") == "1" else "off"
-AUTO_SEND_MODE = AUTO_SEND_MODE.lower()
-
-GREEN_TOPICS = {
-    t.strip()
-    for t in os.getenv(
-        "GREEN_TOPICS",
-        "find_bin_day,book_hard_waste,bin_requests,rates_pay,parking_fines_pay,disability_parking,libraries,contact",
-    ).split(",")
-    if t.strip()
-}
-
-HEADER_AUTO = os.getenv(
-    "HEADER_AUTO",
-    "Automated council reply — sourced from official Wyndham pages",
-)
-
-CATEGORY_SENT = os.getenv("CATEGORY_SENT", "Auto-sent")
-CATEGORY_REVIEW = os.getenv("CATEGORY_REVIEW", "Needs review")
-
-GRAPH = "https://graph.microsoft.com/v1.0"
-TOKEN_URL = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
-UA = "Mozilla/5.0 CivReply Worker"
+# ====== GRAPH AUTH ======
+AUTH_SCOPE = "https://graph.microsoft.com/.default"
+TOKEN_URL  = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 session = requests.Session()
-session.headers.update({"User-Agent": UA})
+session.headers["Content-Type"] = "application/json"
 
-# ------------ Graph helpers ------------
-
-def _token():
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials",
-        "scope": "https://graph.microsoft.com/.default",
-    }
-    r = session.post(TOKEN_URL, data=data, timeout=20)
-    r.raise_for_status()
-    return r.json()["access_token"]
-
-def _auth_headers(tok):
-    return {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
-
-def _get_user_id(tok):
-    r = session.get(f"{GRAPH}/users/{MAILBOX}", headers=_auth_headers(tok), timeout=20)
-    r.raise_for_status()
-    return r.json()["id"]
-
-def _list_unread(tok, user_id, top=20):
-    url = (
-        f"{GRAPH}/users/{user_id}/mailFolders/Inbox/messages"
-        f"?$select=id,subject,from,body,bodyPreview,categories,receivedDateTime,internetMessageId"
-        f"&$filter=isRead eq false"
-        f"&$orderby=receivedDateTime desc&$top={top}"
+def get_token():
+    resp = requests.post(
+        TOKEN_URL,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": AUTH_SCOPE,
+            "grant_type": "client_credentials",
+        },
+        timeout=20,
     )
-    r = session.get(url, headers=_auth_headers(tok), timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["access_token"]
+
+def graph_headers(token):
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+# ====== SIMPLE STATE (dedupe) ======
+STATE_PATH = "/tmp/processed_ids.json"
+def load_state():
+    try:
+        return set(json.load(open(STATE_PATH)))
+    except Exception:
+        return set()
+
+def save_state(s):
+    try:
+        json.dump(list(s), open(STATE_PATH, "w"))
+    except Exception:
+        pass
+
+processed_ids = load_state()
+
+# ====== CLASSIFIER ======
+GREEN_TOPICS = [t.strip().lower() for t in GREEN_TOPICS_ENV.split(",") if t.strip()]
+
+TOPIC_KEYWORDS = {
+    "waste": ["bin", "bins", "waste", "rubbish", "garbage", "recycling", "collection", "hard rubbish"],
+    "rates": ["rates", "rate notice", "pay rates", "instalment", "due date"],
+    "libraries": ["library", "libraries", "books", "tarneit library", "werribee library", "hours"],
+    "animals": ["dog", "cat", "animal", "pet registration", "microchip"],
+    "opening hours": ["opening hours", "hours", "what time", "open today", "public holiday hours"],
+    "general info": ["information", "contact", "help", "assistance", "services"],
+}
+
+def classify_topic(text):
+    t = text.lower()
+    scores = {topic: 0 for topic in TOPIC_KEYWORDS}
+    for topic, kws in TOPIC_KEYWORDS.items():
+        for kw in kws:
+            if kw in t:
+                scores[topic] += 1
+    # choose best topic
+    topic = max(scores, key=scores.get)
+    matched = scores[topic] > 0
+    if not matched:
+        topic = "general info"
+    is_green = topic in GREEN_TOPICS
+    return topic, is_green
+
+# ====== RETRIEVER ======
+# Expect retriever_catalog.answer(query, topic=None, council="wyndham", format="email") -> dict with fields:
+#   { "answer_html": "<p>...</p>", "links": [{"title":"...", "url":"..."}] }
+try:
+    from retriever_catalog import answer as retrieve_answer
+except Exception:
+    def retrieve_answer(query, topic=None, council="wyndham", format="email"):
+        # Minimal safe fallback so you can test immediately.
+        # Replace with your real retrieval pipeline.
+        base = (
+            "<p>Thanks for your email. Here’s information related to your question.</p>"
+            "<ul>"
+            "<li>Use the council’s online tools to check collection days by address/suburb.</li>"
+            "<li>If a collection is missed, report it via the council’s waste/service request portal and follow the prompts.</li>"
+            "<li>Keep bins out by 6am on collection day and ensure lid closes.</li>"
+            "</ul>"
+        )
+        links = [
+            {"title": "Wyndham – Waste & Recycling", "url": "https://www.wyndham.vic.gov.au/services/waste-recycling"},
+            {"title": "Wyndham – Report a missed bin", "url": "https://www.wyndham.vic.gov.au"}  # replace by retriever
+        ]
+        return {
+            "answer_html": base,
+            "links": links,
+        }
+
+def build_email_html(user_body_text, generated):
+    # generated: dict from retriever with "answer_html" + "links"
+    links_html = ""
+    if generated.get("links"):
+        items = "".join([f'<li><a href="{l["url"]}">{l["title"]}</a></li>' for l in generated["links"][:6]])
+        links_html = f"<p><strong>Official links:</strong></p><ul>{items}</ul>"
+    signature_html = f"<p>{REPLY_SIGNATURE.replace(chr(10), '<br>')}</p>"
+    # Keep it simple, top-summary style
+    return f"""
+<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5">
+  <p>Hi,</p>
+  {generated.get("answer_html","<p>Thanks for your email.</p>")}
+  {links_html}
+  {signature_html}
+  <hr>
+  <p style="color:#777">Original question:</p>
+  <blockquote style="margin:0 0 0 1em;color:#555;border-left:3px solid #ddd;padding-left:.8em">{user_body_text}</blockquote>
+</div>
+    """.strip()
+
+# ====== GRAPH HELPERS ======
+def list_unread_messages(token):
+    # Only basic fields + bodyPreview to keep payload small. We'll fetch the body content per-message.
+    url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/mailFolders/Inbox/messages"
+    params = {
+        "$filter": "isRead eq false",
+        "$select": "id,subject,from,receivedDateTime,hasAttachments,conversationId,internetMessageId",
+        "$top": "15",
+        "$orderby": "receivedDateTime desc",
+    }
+    r = session.get(url, headers=graph_headers(token), params=params, timeout=20)
     r.raise_for_status()
     return r.json().get("value", [])
 
-def _create_reply_draft(tok, user_id, msg_id):
-    r = session.post(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}/createReply",
-        headers=_auth_headers(tok),
-        timeout=20,
-    )
+def get_message_body(token, msg_id):
+    url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
+    params = {"$select": "id,subject,body,from"}
+    r = session.get(url, headers=graph_headers(token), params=params, timeout=20)
     r.raise_for_status()
-    return r.json()["id"]
+    data = r.json()
+    # body is HTML; we’ll also extract a text version for classification
+    body_html = data.get("body", {}).get("content", "") or ""
+    # naïve text strip:
+    body_text = re.sub("<[^<]+?>", " ", body_html)
+    body_text = re.sub(r"\s+", " ", body_text).strip()
+    return data, body_text, body_html
 
-def _update_message_html(tok, user_id, msg_id, html_body):
+def add_categories(token, msg_id, cats):
+    url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
+    payload = {"categories": cats}
+    r = session.patch(url, headers=graph_headers(token), data=json.dumps(payload), timeout=20)
+    # Don’t fail if categories not enabled; best-effort
+    return r.status_code
+
+def mark_read(token, msg_id):
+    url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
+    payload = {"isRead": True}
+    r = session.patch(url, headers=graph_headers(token), data=json.dumps(payload), timeout=20)
+    return r.status_code
+
+def create_reply_draft(token, original_msg_id, html_body):
+    # 1) createReply -> returns a draft with default body
+    url_create = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{original_msg_id}/createReply"
+    r = session.post(url_create, headers=graph_headers(token), timeout=20)
+    r.raise_for_status()
+    draft = r.json()
+    draft_id = draft["id"]
+    # 2) overwrite body with our HTML
+    url_update = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{draft_id}"
     payload = {"body": {"contentType": "HTML", "content": html_body}}
-    r = session.patch(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}",
-        headers=_auth_headers(tok),
-        data=json.dumps(payload),
-        timeout=20,
-    )
-    r.raise_for_status()
-
-def _send_message(tok, user_id, msg_id):
-    r = session.post(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}/send",
-        headers=_auth_headers(tok),
-        timeout=20,
-    )
-    if r.status_code not in (200, 202):
-        r.raise_for_status()
-
-def _patch_categories(tok, user_id, msg_id, add):
-    r = session.get(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}?$select=categories",
-        headers=_auth_headers(tok),
-        timeout=20,
-    )
-    r.raise_for_status()
-    current = set(r.json().get("categories", []))
-    new_cats = list(sorted(current.union(set(add))))
-    r2 = session.patch(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}",
-        headers=_auth_headers(tok),
-        data=json.dumps({"categories": new_cats}),
-        timeout=20,
-    )
+    r2 = session.patch(url_update, headers=graph_headers(token), data=json.dumps(payload), timeout=20)
     r2.raise_for_status()
+    return draft_id
 
-def _mark_read(tok, user_id, msg_id, is_read=True):
-    r = session.patch(
-        f"{GRAPH}/users/{user_id}/messages/{msg_id}",
-        headers=_auth_headers(tok),
-        data=json.dumps({"isRead": bool(is_read)}),
-        timeout=20,
-    )
+def send_draft(token, draft_id):
+    url_send = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{draft_id}/send"
+    r = session.post(url_send, headers=graph_headers(token), timeout=20)
     r.raise_for_status()
+    return True
 
-# ------------ Message helpers ------------
+def process_message(token, m):
+    msg_id = m["id"]
+    if msg_id in processed_ids:
+        return
 
-def _html_to_text(s):
-    if not s:
-        return ""
-    soup = BeautifulSoup(s, "html.parser")
-    for t in soup(["script", "style", "noscript", "svg"]):
-        t.decompose()
-    text = soup.get_text(" ").strip()
-    return re.sub(r"\s+", " ", text)
-
-def _extract_sender(m):
     try:
-        return m["from"]["emailAddress"]["address"]
-    except Exception:
-        return None
+        data, body_text, _ = get_message_body(token, msg_id)
+        subject = data.get("subject", "")
+        sender  = (data.get("from", {}) or {}).get("emailAddress", {}).get("address", "")
 
-def _message_text(m):
-    subj = (m.get("subject") or "").strip()
-    body_html = (m.get("body") or {}).get("content") or ""
-    body_text = _html_to_text(body_html)
-    return (("Subject: " + subj + "\n\n") if subj else "") + body_text
+        print(f"Processing: {subject!r} from {sender}")
 
-def _should_autosend(topics):
-    """Decide whether to auto-send based on mode and topics."""
-    mode = AUTO_SEND_MODE
-    if mode == "always":
-        return True
-    if mode == "off":
-        return False
-    # "green" mode: one clear topic and in GREEN_TOPICS
-    if not topics or len(topics) > 1:
-        return False
-    return topics[0] in GREEN_TOPICS
+        topic, is_green = classify_topic(f"{subject}\n{body_text}")
+        print(f"Classified topic: {topic} | GREEN={is_green}")
 
-# ------------ Core processing ------------
-
-def process_message(tok, user_id, msg):
-    mid = msg["id"]
-    sender = _extract_sender(msg) or "(unknown)"
-    text = _message_text(msg)
-
-    # Classify & decide send policy
-    topics = rc._classify(text)
-    autosend = _should_autosend(topics)
-
-    # Generate the reply (HTML) + citations
-    body_html, citations = rc.answer(text, COUNCIL_NAME)
-
-    # If we will auto-send, swap the banner text to an autoresponder header
-    if autosend:
-        body_html = body_html.replace(
-            "Auto-drafted reply — please review before sending",
-            HEADER_AUTO,
+        # Generate answer via retriever
+        generated = retrieve_answer(
+            query=f"Subject: {subject}\n\nBody: {body_text}",
+            topic=topic,
+            council="wyndham",
+            format="email",
         )
+        html = build_email_html(body_text, generated)
 
-    # Create reply draft in the thread
-    reply_id = _create_reply_draft(tok, user_id, mid)
-    _update_message_html(tok, user_id, reply_id, body_html)
+        draft_id = create_reply_draft(token, msg_id, html)
 
-    if autosend:
-        _send_message(tok, user_id, reply_id)
-        _patch_categories(tok, user_id, mid, [CATEGORY_SENT])
-        _mark_read(tok, user_id, mid, True)
-        print(f"[SENT] to {sender} | topics={topics} | cites={len(citations)}")
-    else:
-        _patch_categories(tok, user_id, mid, [CATEGORY_REVIEW])
-        # leave unread for a human to view in the shared inbox
-        print(f"[DRAFTED] for {sender} | topics={topics} | cites={len(citations)}")
+        if is_green and AUTO_SEND_GREEN:
+            send_draft(token, draft_id)
+            try:
+                add_categories(token, msg_id, [CATEGORY_REPLIED])
+            except Exception:
+                pass
+            mark_read(token, msg_id)
+            print(f"✅ Auto-sent reply to message {msg_id}")
+        else:
+            try:
+                add_categories(token, msg_id, [CATEGORY_NEEDSREV])
+            except Exception:
+                pass
+            print(f"✳️ Draft created for review (message {msg_id})")
 
-# ------------ Main loop ------------
+        processed_ids.add(msg_id)
+        save_state(processed_ids)
+
+    except Exception as e:
+        print("❌ Error processing message:", e)
+        traceback.print_exc()
 
 def main():
-    tok = _token()
-    user_id = _get_user_id(tok)
-
-    print(
-        f"Worker up. Mailbox: {MAILBOX} | council='{COUNCIL_NAME}' | "
-        f"mode={AUTO_SEND_MODE} | greens={sorted(GREEN_TOPICS)}"
-    )
+    if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET, MAILBOX_ADDRESS]):
+        raise RuntimeError("Missing required env vars: GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, GRAPH_MAILBOX_ADDRESS")
+    token = get_token()
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Worker started. Poll every {POLL_SECONDS}s. Auto-send GREEN={AUTO_SEND_GREEN}. GREEN_TOPICS={GREEN_TOPICS}")
 
     while True:
         try:
-            msgs = _list_unread(tok, user_id, top=15)
-            for m in msgs:
-                cats = set(m.get("categories") or [])
-                # Skip if already processed in a previous cycle
-                if CATEGORY_SENT in cats or CATEGORY_REVIEW in cats:
-                    continue
-                process_message(tok, user_id, m)
-
-        except requests.HTTPError as e:
-            # Refresh token on 401, otherwise log and continue
-            status = getattr(e.response, "status_code", None)
-            if status == 401:
-                try:
-                    tok = _token()
-                    print("[INFO] Token refreshed after 401")
-                except Exception as ee:
-                    print(f"[AUTH ERR] {ee}")
-                    time.sleep(POLL_SECONDS)
+            # Refresh token roughly every 40 minutes or when we get 401s; simple approach: fetch each loop
+            token = get_token()
+            msgs = list_unread_messages(token)
+            if msgs:
+                for m in msgs:
+                    process_message(token, m)
             else:
-                body = getattr(e.response, "text", "") or ""
-                print(f"[HTTP ERR] {e} | body={body[:300]}")
-                time.sleep(POLL_SECONDS)
-
+                print(f"[{datetime.now().isoformat()}] No unread messages.")
+        except requests.HTTPError as he:
+            print("HTTP error:", he.response.status_code, he.response.text)
         except Exception as e:
-            print(f"[ERR] {e}")
-            time.sleep(POLL_SECONDS)
-
+            print("Unexpected error:", e)
+            traceback.print_exc()
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
