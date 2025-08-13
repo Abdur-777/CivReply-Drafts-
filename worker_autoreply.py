@@ -1,34 +1,64 @@
 # worker_autoreply.py
 # Polls Microsoft Graph for unread emails and auto-replies using your retriever.
+#
+# Key behaviors:
+# - Uses uniqueBody (cleaner than body) to strip old threads/signatures.
+# - Calls retriever with format="body" so the worker wraps the email consistently.
+# - Skips obvious auto-replies and messages from ourselves.
+# - Auto-sends only for GREEN topics AND GREEN risk (configurable).
+# - Best-effort categories + mark read on send.
+#
+# ENV:
+#   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, GRAPH_MAILBOX_ADDRESS
+#   AUTO_SEND_GREEN=1|0
+#   GREEN_TOPICS="waste,rates,libraries,animals,opening hours,general info"
+#   POLL_SECONDS=30
+#   REPLY_FROM_NAME="Wyndham Information Assistant" (not used directly; kept for future)
+#   REPLY_SIGNATURE="—\nWyndham Information Assistant\n(This is an automated reply)"
+#   CATEGORY_REPLIED="AutoReplied"
+#   CATEGORY_NEEDS_REVIEW="Needs review"
+#   STATE_PATH="/tmp/processed_ids.json"
 
-import os, time, json, re, traceback
-import requests
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import traceback
 from datetime import datetime, timezone
+
+import requests
 
 # ====== ENV ======
 TENANT_ID         = os.environ.get("GRAPH_TENANT_ID", "")
 CLIENT_ID         = os.environ.get("GRAPH_CLIENT_ID", "")
 CLIENT_SECRET     = os.environ.get("GRAPH_CLIENT_SECRET", "")
 MAILBOX_ADDRESS   = os.environ.get("GRAPH_MAILBOX_ADDRESS", "")   # e.g. "wyndham-auto@yourdomain.com"
+
 AUTO_SEND_GREEN   = os.environ.get("AUTO_SEND_GREEN", "1") == "1" # "1" to auto-send, else drafts
 GREEN_TOPICS_ENV  = os.environ.get("GREEN_TOPICS", "waste,rates,libraries,animals,opening hours,general info")
 POLL_SECONDS      = int(os.environ.get("POLL_SECONDS", "30"))
-FROM_DISPLAY_NAME = os.environ.get("REPLY_FROM_NAME", "Wyndham Information Assistant")
 REPLY_SIGNATURE   = os.environ.get("REPLY_SIGNATURE", "—\nWyndham Information Assistant\n(This is an automated reply)")
 
-# Optional labeling/categories on the original message
 CATEGORY_REPLIED  = os.environ.get("CATEGORY_REPLIED", "AutoReplied")
 CATEGORY_NEEDSREV = os.environ.get("CATEGORY_NEEDS_REVIEW", "Needs review")
 
-# ====== GRAPH AUTH ======
 AUTH_SCOPE = "https://graph.microsoft.com/.default"
 TOKEN_URL  = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+STATE_PATH = os.environ.get("STATE_PATH", "/tmp/processed_ids.json")
+
+# ====== HTTP session ======
 session = requests.Session()
 session.headers["Content-Type"] = "application/json"
 
-def get_token():
+def log(msg: str) -> None:
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
+
+# ====== TOKEN ======
+def get_token() -> str:
     resp = requests.post(
         TOKEN_URL,
         data={
@@ -43,11 +73,10 @@ def get_token():
     data = resp.json()
     return data["access_token"]
 
-def graph_headers(token):
+def graph_headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 # ====== SIMPLE STATE (dedupe) ======
-STATE_PATH = "/tmp/processed_ids.json"
 def load_state():
     try:
         return set(json.load(open(STATE_PATH)))
@@ -62,42 +91,78 @@ def save_state(s):
 
 processed_ids = load_state()
 
-# ====== CLASSIFIER ======
+# ====== TOPIC CLASSIFIER (naive keywords) ======
 GREEN_TOPICS = [t.strip().lower() for t in GREEN_TOPICS_ENV.split(",") if t.strip()]
 
 TOPIC_KEYWORDS = {
-    "waste": ["bin", "bins", "waste", "rubbish", "garbage", "recycling", "collection", "hard rubbish"],
-    "rates": ["rates", "rate notice", "pay rates", "instalment", "due date"],
-    "libraries": ["library", "libraries", "books", "tarneit library", "werribee library", "hours"],
-    "animals": ["dog", "cat", "animal", "pet registration", "microchip"],
-    "opening hours": ["opening hours", "hours", "what time", "open today", "public holiday hours"],
+    "waste": ["bin", "bins", "waste", "rubbish", "garbage", "recycling", "collection", "hard rubbish", "green waste", "fogo"],
+    "rates": ["rates", "rate notice", "pay rates", "instalment", "installment", "due date", "valuation"],
+    "libraries": ["library", "libraries", "books", "tarneit library", "werribee library", "point cook library", "hours"],
+    "animals": ["dog", "cat", "animal", "pet registration", "microchip", "desex"],
+    "opening hours": ["opening hours", "hours", "what time", "open today", "public holiday hours", "closing time"],
     "general info": ["information", "contact", "help", "assistance", "services"],
 }
 
-def classify_topic(text):
-    t = text.lower()
+def classify_topic(text: str):
+    t = (text or "").lower()
     scores = {topic: 0 for topic in TOPIC_KEYWORDS}
     for topic, kws in TOPIC_KEYWORDS.items():
         for kw in kws:
             if kw in t:
                 scores[topic] += 1
-    # choose best topic
     topic = max(scores, key=scores.get)
-    matched = scores[topic] > 0
-    if not matched:
+    if scores[topic] == 0:
         topic = "general info"
     is_green = topic in GREEN_TOPICS
     return topic, is_green
 
+# ====== RISK HEURISTICS (GREEN/AMBER/RED) ======
+AMBER_TRIGGERS = [
+    "complaint","unhappy","delay","refund","appeal","escalate","supervisor",
+    "deadline","urgent","threat","media","ombudsman","privacy","frustrated","angry"
+]
+RED_TRIGGERS = [
+    "foi","freedom of information","accident","injury","legal","threaten","assault",
+    "payment dispute","chargeback","personal information request","vulnerable","danger","police"
+]
+PII_PATTERNS = [
+    re.compile(r"\b\d{8,}\b"),      # long numeric ids
+    re.compile(r"\b\+?\d{9,15}\b"), # phone numbers
+]
+
+def classify_risk(text: str):
+    t = (text or "").lower()
+    risk = "GREEN"
+    reasons = []
+    if any(k in t for k in RED_TRIGGERS):
+        risk = "RED"; reasons.append("High-risk keyword")
+    elif any(k in t for k in AMBER_TRIGGERS):
+        risk = "AMBER"; reasons.append("Potential complaint/escalation")
+    if any(p.search(t) for p in PII_PATTERNS):
+        if risk == "GREEN":
+            risk = "AMBER"
+        reasons.append("PII detected")
+    if not reasons:
+        reasons.append("No risk triggers detected")
+    return risk, reasons
+
+# ====== AUTO-REPLY LOOP GUARD ======
+AUTO_REPLY_SUBJECT_PATTERNS = (
+    "automatic reply", "auto reply", "autoreply", "out of office", "ooo",
+    "delivery status notification", "delivery failure", "mail delivery", "postmaster"
+)
+
+def looks_like_auto_reply(subject: str) -> bool:
+    s = (subject or "").lower()
+    return any(p in s for p in AUTO_REPLY_SUBJECT_PATTERNS)
+
 # ====== RETRIEVER ======
-# Expect retriever_catalog.answer(query, topic=None, council="wyndham", format="email") -> dict with fields:
+# Expect retriever_catalog.answer(query, topic=None, council="wyndham", format="body") -> dict
 #   { "answer_html": "<p>...</p>", "links": [{"title":"...", "url":"..."}] }
 try:
     from retriever_catalog import answer as retrieve_answer
 except Exception:
-    def retrieve_answer(query, topic=None, council="wyndham", format="email"):
-        # Minimal safe fallback so you can test immediately.
-        # Replace with your real retrieval pipeline.
+    def retrieve_answer(query, topic=None, council="wyndham", format="body"):
         base = (
             "<p>Thanks for your email. Here’s information related to your question.</p>"
             "<ul>"
@@ -108,36 +173,12 @@ except Exception:
         )
         links = [
             {"title": "Wyndham – Waste & Recycling", "url": "https://www.wyndham.vic.gov.au/services/waste-recycling"},
-            {"title": "Wyndham – Report a missed bin", "url": "https://www.wyndham.vic.gov.au"}  # replace by retriever
+            {"title": "Wyndham – Contact us", "url": "https://www.wyndham.vic.gov.au/contact-us"},
         ]
-        return {
-            "answer_html": base,
-            "links": links,
-        }
-
-def build_email_html(user_body_text, generated):
-    # generated: dict from retriever with "answer_html" + "links"
-    links_html = ""
-    if generated.get("links"):
-        items = "".join([f'<li><a href="{l["url"]}">{l["title"]}</a></li>' for l in generated["links"][:6]])
-        links_html = f"<p><strong>Official links:</strong></p><ul>{items}</ul>"
-    signature_html = f"<p>{REPLY_SIGNATURE.replace(chr(10), '<br>')}</p>"
-    # Keep it simple, top-summary style
-    return f"""
-<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5">
-  <p>Hi,</p>
-  {generated.get("answer_html","<p>Thanks for your email.</p>")}
-  {links_html}
-  {signature_html}
-  <hr>
-  <p style="color:#777">Original question:</p>
-  <blockquote style="margin:0 0 0 1em;color:#555;border-left:3px solid #ddd;padding-left:.8em">{user_body_text}</blockquote>
-</div>
-    """.strip()
+        return {"answer_html": base, "links": links}
 
 # ====== GRAPH HELPERS ======
-def list_unread_messages(token):
-    # Only basic fields + bodyPreview to keep payload small. We'll fetch the body content per-message.
+def list_unread_messages(token: str):
     url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/mailFolders/Inbox/messages"
     params = {
         "$filter": "isRead eq false",
@@ -149,33 +190,34 @@ def list_unread_messages(token):
     r.raise_for_status()
     return r.json().get("value", [])
 
-def get_message_body(token, msg_id):
+def get_message_body(token: str, msg_id: str):
     url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
-    params = {"$select": "id,subject,body,from"}
+    params = {"$select": "id,subject,body,uniqueBody,from"}
     r = session.get(url, headers=graph_headers(token), params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
-    # body is HTML; we’ll also extract a text version for classification
-    body_html = data.get("body", {}).get("content", "") or ""
-    # naïve text strip:
+    # Prefer uniqueBody; fall back to body
+    body_html = (data.get("uniqueBody") or {}).get("content") \
+                or (data.get("body") or {}).get("content") \
+                or ""
+    # basic strip to plain text (for classification and quoting)
     body_text = re.sub("<[^<]+?>", " ", body_html)
     body_text = re.sub(r"\s+", " ", body_text).strip()
     return data, body_text, body_html
 
-def add_categories(token, msg_id, cats):
+def add_categories(token: str, msg_id: str, cats):
     url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
     payload = {"categories": cats}
     r = session.patch(url, headers=graph_headers(token), data=json.dumps(payload), timeout=20)
-    # Don’t fail if categories not enabled; best-effort
     return r.status_code
 
-def mark_read(token, msg_id):
+def mark_read(token: str, msg_id: str):
     url = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{msg_id}"
     payload = {"isRead": True}
     r = session.patch(url, headers=graph_headers(token), data=json.dumps(payload), timeout=20)
     return r.status_code
 
-def create_reply_draft(token, original_msg_id, html_body):
+def create_reply_draft(token: str, original_msg_id: str, html_body: str) -> str:
     # 1) createReply -> returns a draft with default body
     url_create = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{original_msg_id}/createReply"
     r = session.post(url_create, headers=graph_headers(token), timeout=20)
@@ -189,80 +231,131 @@ def create_reply_draft(token, original_msg_id, html_body):
     r2.raise_for_status()
     return draft_id
 
-def send_draft(token, draft_id):
+def send_draft(token: str, draft_id: str) -> bool:
     url_send = f"{GRAPH_BASE}/users/{MAILBOX_ADDRESS}/messages/{draft_id}/send"
     r = session.post(url_send, headers=graph_headers(token), timeout=20)
     r.raise_for_status()
     return True
 
-def process_message(token, m):
+# ====== EMAIL BUILDER ======
+def build_email_html(user_body_text: str, generated: dict) -> str:
+    # generated["answer_html"] is a BODY (not full email)
+    answer_body_html = generated.get("answer_html", "<p>Thanks for your email.</p>")
+
+    links_html = ""
+    if generated.get("links"):
+        items = "".join(
+            f'<li><a href="{l["url"]}">{l["title"]}</a></li>'
+            for l in generated["links"][:6]
+        )
+        links_html = f"<p><strong>Official links:</strong></p><ul>{items}</ul>"
+
+    signature_html = f"<p>{REPLY_SIGNATURE.replace(chr(10), '<br>')}</p>"
+
+    # Escape the quoted original (we pass text, so it’s already de-HTML’d)
+    quote_text = re.sub(r"\s+", " ", user_body_text or "").strip()
+    quote_html = (quote_text
+                  .replace("&", "&amp;")
+                  .replace("<", "&lt;")
+                  .replace(">", "&gt;"))
+
+    return f"""
+<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5">
+  <p>Hi,</p>
+  {answer_body_html}
+  {links_html}
+  {signature_html}
+  <hr>
+  <p style="color:#777">Original question:</p>
+  <blockquote style="margin:0 0 0 1em;color:#555;border-left:3px solid #ddd;padding-left:.8em">{quote_html}</blockquote>
+</div>
+    """.strip()
+
+# ====== PROCESS ONE MESSAGE ======
+def process_message(token: str, m: dict):
     msg_id = m["id"]
     if msg_id in processed_ids:
         return
 
     try:
         data, body_text, _ = get_message_body(token, msg_id)
-        subject = data.get("subject", "")
-        sender  = (data.get("from", {}) or {}).get("emailAddress", {}).get("address", "")
+        subject = (data.get("subject") or "").strip()
+        sender  = ((data.get("from") or {}).get("emailAddress") or {}).get("address", "").strip()
 
-        print(f"Processing: {subject!r} from {sender}")
+        # Skip if from ourselves or looks like an auto-reply
+        if sender and MAILBOX_ADDRESS and sender.lower() == MAILBOX_ADDRESS.lower():
+            processed_ids.add(msg_id); save_state(processed_ids)
+            log(f"Skip self message {msg_id}")
+            return
+        if looks_like_auto_reply(subject):
+            processed_ids.add(msg_id); save_state(processed_ids)
+            log(f"Skip auto-reply {msg_id}: {subject!r}")
+            return
 
-        topic, is_green = classify_topic(f"{subject}\n{body_text}")
-        print(f"Classified topic: {topic} | GREEN={is_green}")
+        # Classify topic + risk
+        topic, topic_is_green = classify_topic(f"{subject}\n{body_text}")
+        risk, reasons = classify_risk(f"{subject}\n{body_text}")
+        can_autosend = (topic_is_green and risk == "GREEN" and AUTO_SEND_GREEN)
 
-        # Generate answer via retriever
+        log(f"Processing {msg_id}: topic={topic} green={topic_is_green} risk={risk} reasons={'; '.join(reasons)}")
+
+        # Generate answer via retriever (request BODY, not full email)
         generated = retrieve_answer(
             query=f"Subject: {subject}\n\nBody: {body_text}",
             topic=topic,
             council="wyndham",
-            format="email",
+            format="body",
         )
         html = build_email_html(body_text, generated)
 
         draft_id = create_reply_draft(token, msg_id, html)
 
-        if is_green and AUTO_SEND_GREEN:
+        if can_autosend:
             send_draft(token, draft_id)
             try:
                 add_categories(token, msg_id, [CATEGORY_REPLIED])
             except Exception:
                 pass
             mark_read(token, msg_id)
-            print(f"✅ Auto-sent reply to message {msg_id}")
+            log(f"✅ Auto-sent reply to message {msg_id}")
         else:
             try:
                 add_categories(token, msg_id, [CATEGORY_NEEDSREV])
             except Exception:
                 pass
-            print(f"✳️ Draft created for review (message {msg_id})")
+            log(f"✳️ Draft created for review (message {msg_id})")
 
         processed_ids.add(msg_id)
         save_state(processed_ids)
 
+    except requests.HTTPError as he:
+        log(f"HTTP error processing {msg_id}: {he.response.status_code} {he.response.text[:250]}")
     except Exception as e:
-        print("❌ Error processing message:", e)
+        log(f"❌ Error processing message {msg_id}: {e}")
         traceback.print_exc()
 
+# ====== MAIN LOOP ======
 def main():
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET, MAILBOX_ADDRESS]):
         raise RuntimeError("Missing required env vars: GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, GRAPH_MAILBOX_ADDRESS")
-    token = get_token()
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Worker started. Poll every {POLL_SECONDS}s. Auto-send GREEN={AUTO_SEND_GREEN}. GREEN_TOPICS={GREEN_TOPICS}")
 
+    log(f"Worker started. Poll every {POLL_SECONDS}s. Auto-send GREEN={AUTO_SEND_GREEN}. GREEN_TOPICS={GREEN_TOPICS}")
+
+    token = get_token()
     while True:
         try:
-            # Refresh token roughly every 40 minutes or when we get 401s; simple approach: fetch each loop
+            # refresh token each loop (simple & safe)
             token = get_token()
             msgs = list_unread_messages(token)
-            if msgs:
+            if not msgs:
+                log("No unread messages.")
+            else:
                 for m in msgs:
                     process_message(token, m)
-            else:
-                print(f"[{datetime.now().isoformat()}] No unread messages.")
         except requests.HTTPError as he:
-            print("HTTP error:", he.response.status_code, he.response.text)
+            log(f"HTTP error: {he.response.status_code} {he.response.text[:250]}")
         except Exception as e:
-            print("Unexpected error:", e)
+            log(f"Unexpected error: {e}")
             traceback.print_exc()
         time.sleep(POLL_SECONDS)
 
