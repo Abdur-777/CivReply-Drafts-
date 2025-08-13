@@ -1,46 +1,25 @@
-# app.py — CivReply Drafts (cited answers + Outlook-ready)
-# - Paste-mode works without credentials.
+# app.py — CivReply Drafts (catalog-based answers + Outlook-ready)
+# - Paste mode works without credentials.
 # - Outlook mode needs GRAPH_* env vars.
-# - Cited answers need OPENAI_API_KEY and indexes built by ingest.py.
+# - Answers come from catalog.json via retriever_catalog.py (no embeddings needed).
 
 from dotenv import load_dotenv
-load_dotenv()  # enables local .env during dev
+load_dotenv()
 
 import os
 import json
 import streamlit as st
 
 from drafts_module import render_drafts_ui
+from retriever_catalog import answer as catalog_answer
 
-# Try to use the real retriever (OpenAI + FAISS). Fallback to a simple stub if unavailable.
-try:
-    from retriever import AnswerService
-    _svc = AnswerService()
-    def my_retriever(email_text: str, council_name: str):
-        try:
-            return _svc.answer(email_text, council_name)
-        except Exception as e:
-            # Graceful fallback if index not built yet for this council
-            return (
-                f"<p>Thanks for contacting {council_name}.</p>"
-                f"<p>We’re preparing an answer with the correct links. "
-                f"This enquiry will be escalated to an officer.</p>",
-                []
-            )
-except Exception:
-    def my_retriever(email_text: str, council_name: str):
-        return (
-            f"<p>Thanks for contacting {council_name}.</p>"
-            f"<p>We received your enquiry and will get back to you with more detail soon.</p>",
-            []
-        )
 
-# Councils for the dropdown — load from councils.json if present, else fallback to common VIC councils.
 def load_councils():
+    """Load council names for the dropdown from councils.json; fallback if missing."""
     try:
         with open("councils.json", "r") as f:
             data = json.load(f)
-            # keep JSON order; keys are council names
+            # Preserve JSON order; keys are council names
             return list(data.keys())
     except Exception:
         return [
@@ -63,28 +42,38 @@ def load_councils():
             "Melton City Council",
             "Hume City Council",
             "City of Whittlesea",
-            "Darebin City Council"
+            "Darebin City Council",
+            "City of Greater Geelong",
         ]
+
+
+# === Catalog-backed retriever ===
+def my_retriever(email_text: str, council_name: str):
+    return catalog_answer(email_text, council_name)
+
 
 COUNCILS = load_councils()
 
 st.set_page_config(page_title="CivReply Drafts", page_icon="📬", layout="wide")
 st.title("📬 CivReply Drafts")
-st.caption("Cited email drafts for council inboxes — auto-send only when it’s safe.")
+st.caption("Link-first, cited email drafts for Victorian councils — auto-send only when it’s safe.")
 
-# Tiny status hints so you know what’s configured
+
+# Sidebar status
 with st.sidebar:
     st.subheader("Status")
-    outlook_ok = all(os.getenv(k) for k in ("GRAPH_TENANT_ID","GRAPH_CLIENT_ID","GRAPH_CLIENT_SECRET","GRAPH_MAILBOX_ADDRESS"))
+    outlook_ok = all(os.getenv(k) for k in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "GRAPH_MAILBOX_ADDRESS"))
     st.write("Outlook (Graph):", "✅ Ready" if outlook_ok else "⚠️ Not configured")
-    st.write("OpenAI (citations):", "✅ Key found" if os.getenv("OPENAI_API_KEY") else "⚠️ OPENAI_API_KEY missing")
+    st.write("Catalog:", "✅ catalog.json found" if os.path.exists("catalog.json") else "⚠️ catalog.json missing")
+    st.write("Councils loaded:", len(COUNCILS))
 
-# Main UI (paste mode + Outlook mode if Graph configured)
+
+# Main UI
 render_drafts_ui(get_answer_fn=my_retriever, councils=COUNCILS)
 
 st.divider()
 st.markdown(
     "To enable Outlook integration, set `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, "
     "`GRAPH_CLIENT_SECRET`, and `GRAPH_MAILBOX_ADDRESS` in your environment. "
-    "For cited answers, set `OPENAI_API_KEY` and run `python ingest.py` to build indexes."
+    "To power answers, run `python build_catalog.py` to generate `catalog.json`."
 )
