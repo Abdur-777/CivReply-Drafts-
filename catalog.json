@@ -1,0 +1,170 @@
+{
+  "Wyndham City Council": {
+    "base": "https://www.wyndham.vic.gov.au",
+    "topics": {
+      "waste_overview": {
+        "title": "About Waste & Recycling",
+        "url": "https://www.wyndham.vic.gov.au/services/about-waste-and-recycling"
+      },
+      "household_bins": {
+        "title": "Household Bin Services",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/household-bin-services"
+      },
+      "find_bin_day": {
+        "title": "Find My Bin Collection Day",
+        "url": "https://digital.wyndham.vic.gov.au/myWyndham/"
+      },
+      "waste_calendar_pdf": {
+        "title": "Waste Collection Map & Calendar (PDF)",
+        "url": "https://www.wyndham.vic.gov.au/sites/default/files/2024-05/waste%20calendar.pdf"
+      },
+      "waste_guide": {
+        "title": "Waste & Recycling Guide 2025–26",
+        "url": "https://www.wyndham.vic.gov.au/sites/default/files/2025-06/Waste%20and%20Recycling%20Guide%202025-2026.pdf"
+      },
+      "hard_waste": {
+        "title": "Hard & Green Waste Collection Service",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/hard-and-green-waste-collection-service"
+      },
+      "book_hard_waste": {
+        "title": "Book a Hard & Green Waste Collection",
+        "url": "https://www.wyndham.vic.gov.au/book-hard-green-waste-collection"
+      },
+      "fogo": {
+        "title": "Green-lid Bin (FOGO)",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/green-lid-bin-food-organics-and-garden-organics-fogo"
+      },
+      "bin_requests": {
+        "title": "Bin Requests (new, missing, damaged)",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/household-bin-services#bin-requests"
+      },
+      "recycling_az": {
+        "title": "A–Z Interactive Residential Waste Guide",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/a-z-interactive-residential-waste-guide"
+      },
+      "transfer_station": {
+        "title": "Municipal Tip / RDF (fees, hours)",
+        "url": "https://www.wyndham.vic.gov.au/venues/municipal-tiprdf-refuse-disposal-facility"
+      },
+      "hazardous_waste": {
+        "title": "Other Waste & Recycling (hazardous, Detox Your Home)",
+        "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/other-waste-and-recycling-services-initiatives/other-waste-recycling"
+      },
+
+      "rates_home": {
+        "title": "Rates & Valuations",
+        "url": "https://www.wyndham.vic.gov.au/services/rates-valuations/rates-valuations"
+      },
+      "rates_pay": {
+        "title": "Rates Payments",
+        "url": "https://www.wyndham.vic.gov.au/payments/rates-payments"
+      },
+      "rates_hardship": {
+        "title": "Difficulty Paying Rates",
+        "url": "https://www.wyndham.vic.gov.au/difficulty-paying-rates"
+      },
+      "rates_payment_plan": {
+        "title": "Rates Payment Plan (form)",
+        "url": "https://www.wyndham.vic.gov.au/form/rates-payment-plan"
+      },
+
+      "pet_registration": {
+        "title": "Pet Registration & Ownership",
+        "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-registration-regulations/pet-registration-and-ownership"
+      },
+      "animal_permits": {
+        "title": "Animal Permits",
+        "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-registration-regulations/animal-permits"
+      },
+      "barking_dog": {
+        "title": "Dogs & Cats (complaints, barking, attacks)",
+        "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-complaints-pests/dogs-and-cats"
+      },
+
+      "parking_permits_regs": {
+        "title": "Parking Regulations & Permits",
+        "url": "https://www.wyndham.vic.gov.au/services/roads-parking-transport/parking-regulations-fines/parking-regulations-permits"
+      },
+      "disability_parking": {
+        "title": "Disability Parking Permits",
+        "url": "https://www.wyndham.vic.gov.au/services/aged-disability/disability-parking-permits"
+      },
+      "parking_fines_pay": {
+        "title": "Infringement (Parking Fine) Payments",
+        "url": "https://www.wyndham.vic.gov.au/payments/infringement-payments"
+      },
+      "parking_fine_review": {
+        "title": "Request a Fine Review or Payment Plan",
+        "url": "https://www.wyndham.vic.gov.au/services/roads-parking-transport/parking-regulations-fines/request-review-fine-infringement-notice"
+      },
+
+      "report_issue": {
+        "title": "Raise a Request or Report an Issue",
+        "url": "https://www.wyndham.vic.gov.au/raise-request-or-issue"
+      },
+      "noise": {
+        "title": "Noise & Odour (what’s allowed, how to report)",
+        "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents/noise-odour-pollution"
+      },
+      "graffiti": {
+        "title": "Graffiti (how Council manages it)",
+        "url": "https://theloop.wyndham.vic.gov.au/download_file/view/1773/783"
+      },
+      "trees_nature_strips": {
+        "title": "Maintaining Your Property (trees, nature strips)",
+        "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents/maintaining-your-property"
+      },
+
+      "planning_permits": {
+        "title": "Planning Application Process",
+        "url": "https://www.wyndham.vic.gov.au/services/building-planning/applying-planning-permit/planning-application-process"
+      },
+      "building_permits": {
+        "title": "When is a Building Permit Required?",
+        "url": "https://www.wyndham.vic.gov.au/services/building-planning/do-i-need-approval/when-building-permit-required"
+      },
+      "local_laws": {
+        "title": "Local Laws & Permits (Residents)",
+        "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents"
+      },
+
+      "libraries": {
+        "title": "Libraries (locations, hours, catalogue)",
+        "url": "https://www.wyndham.vic.gov.au/services/libraries"
+      },
+      "hire_a_space": {
+        "title": "Hire a Space (venues & community centres)",
+        "url": "https://www.wyndham.vic.gov.au/services/community-centres-venues/hire-space"
+      },
+      "sports_bookings": {
+        "title": "Sporting Facilities & Reserves for Hire",
+        "url": "https://www.wyndham.vic.gov.au/services/sports-parks-recreation/hire-sports-reserve/sporting-facilities-and-reserves-hire"
+      },
+      "kindergarten_register": {
+        "title": "Register for Kindergarten",
+        "url": "https://www.wyndham.vic.gov.au/services/childrens-services/kindergarten/step-3-register-kindergarten"
+      },
+      "immunisation": {
+        "title": "Immunisation Services",
+        "url": "https://www.wyndham.vic.gov.au/services/childrens-services/immunisation"
+      },
+      "leisure_centres": {
+        "title": "Aquapulse (major leisure centre) & pools",
+        "url": "https://www.wyndham.vic.gov.au/services/sports-parks-recreation/major-sporting-leisure-facilities/aquapulse"
+      },
+
+      "foi": {
+        "title": "Freedom of Information",
+        "url": "https://www.wyndham.vic.gov.au/about-council/your-council/administration/freedom-information-request"
+      },
+      "privacy": {
+        "title": "Privacy Policy",
+        "url": "https://www.wyndham.vic.gov.au/about-council/your-council/administration/privacy-policy"
+      },
+      "contact": {
+        "title": "Contact Us (phone, hours, after-hours)",
+        "url": "https://www.wyndham.vic.gov.au/contact-us"
+      }
+    }
+  }
+}
