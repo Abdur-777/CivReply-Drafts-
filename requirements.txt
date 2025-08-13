@@ -1,15 +1,18 @@
+# Core app
 streamlit==1.35.0
-requests>=2.31.0
-python-dotenv>=1.0.1
-openai>=1.30.0
+requests>=2.31.0,<3.0.0
+python-dotenv>=1.0.1,<2.0.0
+openai>=1.35.0,<2.0.0
+
+# Parsing & HTML
+beautifulsoup4>=4.12.3,<5.0.0
+html5lib>=1.1,<2.0.0
+
+# Embeddings / vector index
+tiktoken>=0.7.0,<1.0.0
+numpy>=1.24.0,<2.0.0
 faiss-cpu>=1.7.4
-beautifulsoup4>=4.12.3
-tiktoken>=0.7.0
-numpy>=1.26.4
-openai>=1.35.0
-html5lib>=1.1
-requests
-beautifulsoup4
-html5lib
-python-dotenv
-openai>=1.35.0
+
+# --- Optional extras (enable retrieval via LangChain; safe to remove if unused) ---
+# langchain-openai>=0.1.7
+# langchain-community>=0.2.0
