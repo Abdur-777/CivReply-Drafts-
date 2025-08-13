@@ -1,560 +1,396 @@
-# retriever_catalog.py — link-grounded answers (Wyndham built-in) — Python 3.8+
-# Returns (html_body, citations) given (email_text, council_name)
-# - Uses catalog.json if present; merges with a built-in Wyndham map.
-# - Classifies the enquiry → picks the most relevant Wyndham pages.
-# - (Optional) If OPENAI_API_KEY is set, generates a short answer strictly from those pages (RAG).
-# - No risky promises; if uncertain, it points to the best link.
+# retriever_catalog.py
+# A lightweight, production-ready answerer used by worker_autoreply.py
+# API: answer(query: str, topic: Optional[str], council: str="wyndham", format: str="email") -> dict
+#
+# Behavior:
+# - Attempts to load a FAISS index at index/{council}/ and retrieve supporting snippets.
+# - If OPENAI_API_KEY + langchain libs are available, it will fuse snippets into a short HTML response.
+# - If not, it falls back to high-quality templates per topic with official link registry.
+# - Always returns: {"answer_html": "<p>...</p>", "links": [{"title": "...", "url": "..."}, ...]}
+#
+# Safe to run without any extra deps: templates will still work.
 
-import os
-import json
-import re
-import html
-import requests
-from bs4 import BeautifulSoup
+from __future__ import annotations
+import os, re, html, json, traceback
+from typing import Dict, List, Tuple, Optional
 
-# Optional LLM grounding (enabled if OPENAI_API_KEY is present)
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-    except Exception:
-        client = None  # fail gracefully if library missing
+# --------------------------
+# Optional dependencies
+# --------------------------
+_LANGCHAIN_OK = True
+_OPENAI_OK = True
+try:
+    # langchain v0.1+ split across packages
+    from langchain_community.vectorstores import FAISS as FAISSStore
+    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+    _ = OpenAIEmbeddings  # to silence linters
+except Exception:
+    _LANGCHAIN_OK = False
 
-CATALOG_PATH = "catalog.json"
-MAX_LINKS = 6
-FETCH_TIMEOUT = 18
-USER_AGENT = "Mozilla/5.0 CivReply"
+try:
+    # We only need this if we decide to call the model directly (for nicer wording)
+    # Using langchain_openai's ChatOpenAI if available; else try bare openai package.
+    import openai  # type: ignore
+except Exception:
+    _OPENAI_OK = False
 
-# ---------------- Built-in catalog: Wyndham ----------------
-BUILTIN_CATALOG = {
-    "Wyndham City Council": {
-        "base": "https://www.wyndham.vic.gov.au",
-        "topics": {
-            # Waste & bins
-            "waste_overview": {
-                "title": "About Waste & Recycling",
-                "url": "https://www.wyndham.vic.gov.au/services/about-waste-and-recycling",
-            },
-            "household_bins": {
-                "title": "Household Bin Services",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/household-bin-services",
-            },
-            "find_bin_day": {
-                "title": "Find My Bin Collection Day",
-                "url": "https://digital.wyndham.vic.gov.au/myWyndham/",
-            },
-            "waste_calendar_pdf": {
-                "title": "Waste Collection Map & Calendar (PDF)",
-                "url": "https://www.wyndham.vic.gov.au/sites/default/files/2024-05/waste%20calendar.pdf",
-            },
-            "waste_guide": {
-                "title": "Waste & Recycling Guide 2025–26",
-                "url": "https://www.wyndham.vic.gov.au/sites/default/files/2025-06/Waste%20and%20Recycling%20Guide%202025-2026.pdf",
-            },
-            "hard_waste": {
-                "title": "Hard & Green Waste Collection Service",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/hard-and-green-waste-collection-service",
-            },
-            "book_hard_waste": {
-                "title": "Book a Hard & Green Waste Collection",
-                "url": "https://www.wyndham.vic.gov.au/book-hard-green-waste-collection",
-            },
-            "fogo": {
-                "title": "Green-lid Bin (FOGO)",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/green-lid-bin-food-organics-and-garden-organics-fogo",
-            },
-            "bin_requests": {
-                "title": "Bin Requests (new, missing, damaged)",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/household-bins/household-bin-services#bin-requests",
-            },
-            "recycling_az": {
-                "title": "A–Z Interactive Residential Waste Guide",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/a-z-interactive-residential-waste-guide",
-            },
-            "transfer_station": {
-                "title": "Municipal Tip / RDF (fees, hours)",
-                "url": "https://www.wyndham.vic.gov.au/venues/municipal-tiprdf-refuse-disposal-facility",
-            },
-            "hazardous_waste": {
-                "title": "Other Waste & Recycling (hazardous, Detox Your Home)",
-                "url": "https://www.wyndham.vic.gov.au/services/waste-recycling/other-waste-and-recycling-services-initiatives/other-waste-recycling",
-            },
+# --------------------------
+# Config / constants
+# --------------------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_APIKEY") or os.environ.get("OPENAI_KEY")
+MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # inexpensive, fast; change if you like
 
-            # Rates
-            "rates_home": {
-                "title": "Rates & Valuations",
-                "url": "https://www.wyndham.vic.gov.au/services/rates-valuations/rates-valuations",
-            },
-            "rates_pay": {
-                "title": "Rates Payments",
-                "url": "https://www.wyndham.vic.gov.au/payments/rates-payments",
-            },
-            "rates_hardship": {
-                "title": "Difficulty Paying Rates",
-                "url": "https://www.wyndham.vic.gov.au/difficulty-paying-rates",
-            },
-            "rates_payment_plan": {
-                "title": "Rates Payment Plan (form)",
-                "url": "https://www.wyndham.vic.gov.au/form/rates-payment-plan",
-            },
+# Where your FAISS index lives (created by your Streamlit admin tool)
+INDEX_ROOT = os.environ.get("FAISS_INDEX_ROOT", "index")
 
-            # Animals
-            "pet_registration": {
-                "title": "Pet Registration & Ownership",
-                "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-registration-regulations/pet-registration-and-ownership",
-            },
-            "animal_permits": {
-                "title": "Animal Permits",
-                "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-registration-regulations/animal-permits",
-            },
-            "barking_dog": {
-                "title": "Dogs & Cats (complaints, barking, attacks)",
-                "url": "https://www.wyndham.vic.gov.au/services/pets-animals/animal-complaints-pests/dogs-and-cats",
-            },
-
-            # Parking & infringements
-            "parking_permits_regs": {
-                "title": "Parking Regulations & Permits",
-                "url": "https://www.wyndham.vic.gov.au/services/roads-parking-transport/parking-regulations-fines/parking-regulations-permits",
-            },
-            "disability_parking": {
-                "title": "Disability Parking Permits",
-                "url": "https://www.wyndham.vic.gov.au/services/aged-disability/disability-parking-permits",
-            },
-            "parking_fines_pay": {
-                "title": "Infringement (Parking Fine) Payments",
-                "url": "https://www.wyndham.vic.gov.au/payments/infringement-payments",
-            },
-            "parking_fine_review": {
-                "title": "Request a Fine Review or Payment Plan",
-                "url": "https://www.wyndham.vic.gov.au/services/roads-parking-transport/parking-regulations-fines/request-review-fine-infringement-notice",
-            },
-
-            # Requests & local laws
-            "report_issue": {
-                "title": "Raise a Request or Report an Issue",
-                "url": "https://www.wyndham.vic.gov.au/raise-request-or-issue",
-            },
-            "noise": {
-                "title": "Noise & Odour (what’s allowed, how to report)",
-                "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents/noise-odour-pollution",
-            },
-            "graffiti": {
-                "title": "Graffiti (how Council manages it)",
-                "url": "https://theloop.wyndham.vic.gov.au/download_file/view/1773/783",
-            },
-            "trees_nature_strips": {
-                "title": "Maintaining Your Property (trees, nature strips)",
-                "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents/maintaining-your-property",
-            },
-
-            # Planning & building
-            "planning_permits": {
-                "title": "Planning Application Process",
-                "url": "https://www.wyndham.vic.gov.au/services/building-planning/applying-planning-permit/planning-application-process",
-            },
-            "building_permits": {
-                "title": "When is a Building Permit Required?",
-                "url": "https://www.wyndham.vic.gov.au/services/building-planning/do-i-need-approval/when-building-permit-required",
-            },
-            "local_laws": {
-                "title": "Local Laws & Permits (Residents)",
-                "url": "https://www.wyndham.vic.gov.au/services/local-laws-permits/laws-permits-residents",
-            },
-
-            # Community services & facilities
-            "libraries": {
-                "title": "Libraries (locations, hours, catalogue)",
-                "url": "https://www.wyndham.vic.gov.au/services/libraries",
-            },
-            "hire_a_space": {
-                "title": "Hire a Space (venues & community centres)",
-                "url": "https://www.wyndham.vic.gov.au/services/community-centres-venues/hire-space",
-            },
-            "sports_bookings": {
-                "title": "Sporting Facilities & Reserves for Hire",
-                "url": "https://www.wyndham.vic.gov.au/services/sports-parks-recreation/hire-sports-reserve/sporting-facilities-and-reserves-hire",
-            },
-            "kindergarten_register": {
-                "title": "Register for Kindergarten",
-                "url": "https://www.wyndham.vic.gov.au/services/childrens-services/kindergarten/step-3-register-kindergarten",
-            },
-            "immunisation": {
-                "title": "Immunisation Services",
-                "url": "https://www.wyndham.vic.gov.au/services/childrens-services/immunisation",
-            },
-            "leisure_centres": {
-                "title": "Aquapulse (major leisure centre) & pools",
-                "url": "https://www.wyndham.vic.gov.au/services/sports-parks-recreation/major-sporting-leisure-facilities/aquapulse",
-            },
-
-            # Governance
-            "foi": {
-                "title": "Freedom of Information",
-                "url": "https://www.wyndham.vic.gov.au/about-council/your-council/administration/freedom-information-request",
-            },
-            "privacy": {
-                "title": "Privacy Policy",
-                "url": "https://www.wyndham.vic.gov.au/about-council/your-council/administration/privacy-policy",
-            },
-            "contact": {
-                "title": "Contact Us (phone, hours, after-hours)",
-                "url": "https://www.wyndham.vic.gov.au/contact-us",
-            },
-        },
+# Registry of official links per council/topic. Keep it generic and safe; update as you curate.
+COUNCIL_LINKS: Dict[str, Dict[str, List[Dict[str, str]]]] = {
+    "wyndham": {
+        "waste": [
+            {"title": "Wyndham – Waste & Recycling", "url": "https://www.wyndham.vic.gov.au/services/waste-recycling"},
+            {"title": "Wyndham – Hard rubbish bookings", "url": "https://www.wyndham.vic.gov.au/services/waste-recycling"},
+            {"title": "Report a missed bin (Wyndham portal)", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "rates": [
+            {"title": "Wyndham – Rates & valuations", "url": "https://www.wyndham.vic.gov.au"},
+            {"title": "Pay your rates online", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "libraries": [
+            {"title": "Wyndham – Libraries & hours", "url": "https://www.wyndham.vic.gov.au"},
+            {"title": "Wyndham – Library locations", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "animals": [
+            {"title": "Wyndham – Animal registration", "url": "https://www.wyndham.vic.gov.au"},
+            {"title": "Wyndham – Pets & animals", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "opening hours": [
+            {"title": "Wyndham – Opening hours & facilities", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "parking": [
+            {"title": "Wyndham – Parking & infringements", "url": "https://www.wyndham.vic.gov.au"},
+            {"title": "Request a review (parking)", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "planning": [
+            {"title": "Wyndham – Planning permits", "url": "https://www.wyndham.vic.gov.au"},
+            {"title": "Wyndham – Building permits", "url": "https://www.wyndham.vic.gov.au"},
+        ],
+        "general info": [
+            {"title": "Wyndham – Services", "url": "https://www.wyndham.vic.gov.au/services"},
+            {"title": "Contact Wyndham City", "url": "https://www.wyndham.vic.gov.au"},
+        ],
     }
 }
-# -----------------------------------------------------------
 
-# Short helper lines per topic (shown above the links if AI answer not available)
-TOPIC_SNIPPETS = {
-    "find_bin_day": "You can check your collection day online and confirm upcoming bin schedules.",
-    "book_hard_waste": "You can lodge a hard & green waste booking online and see the accepted items list.",
-    "hard_waste": "Here’s where to see what’s accepted for hard & green waste, plus how bookings work.",
-    "fogo": "Your green-lid (FOGO) bin takes food organics and garden organics. The guide below explains what goes in.",
-    "bin_requests": "Use the bin services page for new, missing, damaged or stolen bins, and missed collections.",
-    "recycling_az": "Use the A–Z guide to check how to dispose of specific items correctly.",
-    "transfer_station": "Tip/RDF details including location, fees and opening hours are here.",
-    "hazardous_waste": "For chemicals, batteries and other hazardous items, follow these options.",
-    "rates_pay": "You can pay rates online and see payment options and due dates.",
-    "rates_hardship": "If you’re having difficulty paying, you can request hardship assistance or a payment plan.",
-    "parking_permits_regs": "Parking permits and rules are explained here, with how to apply or renew.",
-    "parking_fines_pay": "You can pay infringements online.",
-    "parking_fine_review": "You can request a review or payment plan for an infringement here.",
-    "disability_parking": "Apply for or renew Disability Parking Permits here.",
-    "pet_registration": "Registering/renewing pet registration can be completed online.",
-    "barking_dog": "Find guidance and how to report ongoing dog noise or related concerns.",
-    "report_issue": "Lodge a request or report an issue directly with Council here.",
-    "noise": "This outlines allowed noise times and how to report ongoing noise issues.",
-    "trees_nature_strips": "See what’s allowed for nature strips and how to request street tree works.",
-    "planning_permits": "Learn when you need a planning permit and how to apply.",
-    "building_permits": "Learn when you need a building permit and next steps.",
-    "libraries": "Library locations, opening hours and catalogue are here.",
-    "kindergarten_register": "Register for kindergarten and see key dates and steps.",
-    "immunisation": "See upcoming community immunisation sessions and booking details.",
-    "leisure_centres": "Find opening hours, facilities and memberships for Aquapulse and pools.",
-    "foi": "Request access to information under Freedom of Information.",
-    "privacy": "Council’s privacy policy explains how your information is handled.",
-    "contact": "If you need something else, contact details and hours are here.",
+# Short copy used when FAISS/model aren't available
+TOPIC_TEMPLATES: Dict[str, str] = {
+    "waste": """
+<p>Here’s how to confirm your bin collection day and what to do if a collection is missed.</p>
+<ol>
+  <li><strong>Check collection day:</strong> Use the council’s online tool to confirm your general waste and recycling day by address/suburb.</li>
+  <li><strong>Set-out rules:</strong> Put bins out by 6am on collection day, lid closed, wheels to the kerb, with 0.5m clearance around each bin.</li>
+  <li><strong>Missed collection:</strong> Lodge a “missed service” request via the waste portal and keep your bin out until collected.</li>
+  <li><strong>Hard rubbish:</strong> Book hard rubbish separately via the booking page (limits and eligible items apply).</li>
+</ol>
+""".strip(),
+    "rates": """
+<p>Here are your options to pay rates and where to find due dates.</p>
+<ul>
+  <li><strong>Payment methods:</strong> Online via the rates portal, BPAY, by phone, or in person (see “How to pay” page).</li>
+  <li><strong>Due dates:</strong> Check your latest rates notice or the “Rates & valuations” page for instalment schedules.</li>
+  <li><strong>Assistance:</strong> If experiencing hardship, review payment arrangement options and contact the rates team.</li>
+</ul>
+""".strip(),
+    "libraries": """
+<p>Library hours and services.</p>
+<ul>
+  <li><strong>Hours today:</strong> View the “Libraries” page for each branch’s opening hours (public holiday hours may differ).</li>
+  <li><strong>Services:</strong> Borrow/return, PC access, printing, programs, and events—check each branch page.</li>
+</ul>
+""".strip(),
+    "animals": """
+<p>Registering your pet.</p>
+<ul>
+  <li><strong>Who must register:</strong> Cats and dogs over the minimum age/requirements set by council.</li>
+  <li><strong>What you need:</strong> Microchip number, desexing status, and owner details.</li>
+  <li><strong>How to apply:</strong> Complete the online registration form; fees vary by animal and concessions.</li>
+</ul>
+""".strip(),
+    "opening hours": """
+<p>Opening hours for council facilities vary by site.</p>
+<ul>
+  <li>Use the “Facilities & opening hours” page to view today’s hours for your location.</li>
+  <li>Public holiday hours and special events may change operating times—check the notice on each facility page.</li>
+</ul>
+""".strip(),
+    "parking": """
+<p>Parking fines and reviews.</p>
+<ul>
+  <li><strong>Pay or review:</strong> Use the online infringements portal to pay or request an internal review.</li>
+  <li><strong>Evidence:</strong> Provide photos, permits, or receipts that support your circumstances.</li>
+  <li><strong>Timeframes:</strong> Reviews must be lodged within the timeframe stated on your notice.</li>
+</ul>
+""".strip(),
+    "planning": """
+<p>Planning vs building permits.</p>
+<ul>
+  <li><strong>Planning permit:</strong> Required for land use/development (e.g., new use, signage, overlays). Check the planning scheme.</li>
+  <li><strong>Building permit:</strong> Required for construction safety/compliance (issued by a registered building surveyor).</li>
+  <li><strong>Next steps:</strong> Start with “Do I need a planning permit?” then lodge via the council’s portal.</li>
+</ul>
+""".strip(),
+    "general info": """
+<p>Thanks for your email. Here are quick ways to find the right info:</p>
+<ul>
+  <li>Browse “Services” for waste, pets, permits, rates, and more.</li>
+  <li>Use the website search to jump to specific documents or forms.</li>
+  <li>If this didn’t resolve your question, reply with your address/suburb and any relevant details.</li>
+</ul>
+""".strip(),
 }
 
-# One-liner responses per topic. {link} is replaced with a clickable URL (fallback if AI is off).
-TOPIC_RESPONSES = {
-    "find_bin_day": "You can look up your collection day by address here: {link}.",
-    "book_hard_waste": "You can book a hard & green waste collection and see accepted items and limits: {link}.",
-    "bin_requests": "For new, damaged, stolen or missed bins, use the bin services form: {link}.",
-    "fogo": "Your green-lid (FOGO) bin accepts food and garden organics — details here: {link}.",
-    "rates_pay": "You can pay your rates online and see payment options and due dates: {link}.",
-    "rates_hardship": "If you’re having trouble paying, request hardship help or a payment plan here: {link}.",
-    "parking_fine_review": "To request a review or payment plan for an infringement, start here: {link}.",
-    "parking_fines_pay": "You can pay your infringement online here: {link}.",
-    "pet_registration": "Register or renew your dog/cat online (microchipping required): {link}.",
-    "report_issue": "Lodge a request or report an issue with Council here: {link}.",
-    "planning_permits": "When a planning permit is needed and how to apply: {link}.",
-    "building_permits": "When a building permit is required and next steps: {link}.",
-    "libraries": "Library locations, opening hours and catalogue: {link}.",
-    "contact": "If you need something else, our contact details and hours are here: {link}.",
-}
+# --------------------------
+# Utilities
+# --------------------------
+def _strip_html(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or "")).strip()
 
-# Classification rules: map email text → topic keys (order matters)
-TOPIC_RULES = [
-    # Waste & bins
-    ("book_hard_waste", [r"\b(book|booking)\b.*hard\s*(waste|rubbish)", r"hard\s*(waste|rubbish).*\bbook"]),
-    ("hard_waste",      [r"hard\s*(waste|rubbish)", r"\bbulky\b", r"mattress"]),
-    ("find_bin_day",    [r"\b(bin|waste)\s*(day|calendar|schedule)", r"what\s*day\s*(is|are)\s*.*bin"]),
-    ("bin_requests",    [r"(broken|damaged|stolen)\s*bin", r"replace\s*bin", r"new\s*bin", r"miss(ed|ing)\s*bin", r"bin\s*not\s*collected"]),
-    ("fogo",            [r"\bFOGO\b", r"green\s*bin", r"garden\s*waste", r"organics"]),
-    ("recycling_az",    [r"\b(a-?z|what\s*goes\s*in)\b", r"recycl(e|ing)\s*guide"]),
-    ("transfer_station",[r"\btip\b", r"transfer\s*station", r"\blandfill\b", r"resource\s*recovery"]),
-    ("hazardous_waste", [r"hazard(ous)?", r"chemicals?", r"paint", r"battery", r"e-?waste", r"asbestos"]),
-    ("waste_overview",  [r"\b(bin|waste|recycling|collection)\b"]),
-    ("household_bins",  [r"household\s*bin"]),
+_SUBURB_POSTCODE_RE = re.compile(
+    r"([A-Za-z][A-Za-z\s\-']+)\s*\(?(\d{4})\)?", flags=re.IGNORECASE
+)
 
-    # Parking & infringements
-    ("disability_parking",[r"disability\s*parking", r"\bDPP\b"]),
-    ("parking_fine_review",[r"(appeal|review)\s*(fine|infringement)", r"\bnominat(e|ion)\b"]),
-    ("parking_fines_pay",[r"parking\s*(fine|infringement).*(pay|payment)", r"\bpay\s*fine\b"]),
-    ("parking_permits_regs",[r"parking\s*permit", r"resident\s*permit", r"visitor\s*permit", r"parking\s*regulation"]),
+def _detect_suburb_and_postcode(text: str) -> Tuple[Optional[str], Optional[str]]:
+    m = _SUBURB_POSTCODE_RE.search(text or "")
+    if m:
+        suburb = " ".join(m.group(1).split()).strip()
+        pc = m.group(2)
+        # Avoid false positives like "hours (2024)" by requiring suburb-like words
+        if len(suburb) >= 3 and not suburb.isdigit():
+            return suburb, pc
+    return None, None
 
-    # Rates
-    ("rates_payment_plan",[r"payment\s*plan.*rates"]),
-    ("rates_hardship",   [r"rates?\s*(hardship|assistance)"]),
-    ("rates_pay",        [r"\bpay(ing)?\s*rates?\b", r"rates?\s*payment"]),
-    ("rates_home",       [r"\brates?\b", r"\bvaluation\b"]),
-
-    # Animals
-    ("pet_registration", [r"register\s*(dog|cat|pet)", r"pet\s*registration", r"microchip"]),
-    ("animal_permits",   [r"animal\s*permit"]),
-    ("barking_dog",      [r"\bbark(ing)?\b", r"dog\s*noise", r"dog\s*attack"]),
-
-    # Requests & local laws
-    ("report_issue",     [r"\breport\b", r"request\s*(fix|service)", r"pothole", r"footpath", r"street\s*light", r"graffiti"]),
-    ("noise",            [r"\bnoise\b", r"loud\s*music", r"party", r"construction\s*noise"]),
-    ("graffiti",         [r"\bgraffiti\b"]),
-    ("trees_nature_strips",[r"street\s*tree", r"nature\s*strip", r"prun(e|ing)"]),
-
-    # Planning & building
-    ("planning_permits", [r"planning\s*permit", r"plan\s*permit", r"advertis(ing|ed)"]),
-    ("building_permits", [r"building\s*permit", r"construction", r"demolition", r"surveyor"]),
-    ("local_laws",       [r"local\s*law", r"footpath\s*(trading|dining)", r"amplified\s*sound"]),
-
-    # Community services & facilities
-    ("libraries",        [r"\blibrar(y|ies)\b", r"library\s*hours", r"borrow", r"membership"]),
-    ("hire_a_space",     [r"venue\s*hire", r"hall\s*hire", r"community\s*centre", r"book\s*(a\s*)?venue"]),
-    ("sports_bookings",  [r"sports?(ground| oval| pavilion)", r"book\s*(ground|oval|court)", r"seasonal\s*allocation"]),
-    ("kindergarten_register",[r"\bkind(er|ergarten)\b", r"enrol(l)?", r"child\s*care", r"early\s*years"]),
-    ("immunisation",     [r"\bimmuni[sz]ation\b", r"vaccin(e|ation)"]),
-    ("leisure_centres",  [r"\baquapulse\b", r"\bpool\b", r"leisure\s*centre"]),
-
-    # Governance
-    ("foi",              [r"freedom\s*of\s*information", r"\bFOI\b"]),
-    ("privacy",          [r"\bprivacy\b", r"personal\s*information"]),
-
-    # Fallback
-    ("contact",          [r"\bcontact\b", r"phone", r"email", r"customer\s*service"]),
-]
-
-def _classify(text):
-    """Return up to 4 topic keys that match the email text."""
+def _pick_topic_heuristic(text: str) -> str:
     t = (text or "").lower()
-    hits = []
-    for topic, patterns in TOPIC_RULES:
-        if any(re.search(p, t) for p in patterns):
-            if topic not in hits:
-                hits.append(topic)
-        if len(hits) >= 4:
-            break
-    if not hits:
-        hits = ["contact"]
-    return hits
+    def any_kw(*words): return any(w in t for w in words)
 
-def _deep_merge(base, override):
-    """Deep-merge catalogs where 'override' wins. Shape: {council: {base, topics{...}}}"""
-    out = json.loads(json.dumps(base))  # deep copy
-    for council, cdata in (override or {}).items():
-        if council not in out:
-            out[council] = {"base": cdata.get("base"), "topics": {}}
-        else:
-            if cdata.get("base"):
-                out[council]["base"] = cdata["base"]
-        topics = out[council].get("topics", {})
-        for k, v in (cdata.get("topics") or {}).items():
-            topics[k] = v
-        out[council]["topics"] = topics
-    return out
+    if any_kw("bin", "bins", "waste", "rubbish", "recycling", "hard rubbish", "collection"):
+        return "waste"
+    if any_kw("rate", "rates", "valuation", "instalment", "bpay"):
+        return "rates"
+    if any_kw("library", "libraries", "tarneit library", "werribee library", "point cook library", "hours"):
+        return "libraries"
+    if any_kw("dog", "cat", "pet", "animal", "microchip", "registration"):
+        return "animals"
+    if any_kw("opening hours", "open today", "close", "closing time"):
+        return "opening hours"
+    if any_kw("parking", "infringement", "fine", "ticket"):
+        return "parking"
+    if any_kw("planning permit", "building permit", "planning", "overlays", "construction"):
+        return "planning"
+    return "general info"
 
-def _normalize_catalog_blob(blob):
-    """
-    Accept either:
-      A) { "Wyndham City Council": { "base":..., "topics":{...} }, ... }
-      B) { "base":..., "topics":{...} }   (single council blob) -> assume Wyndham
-    """
-    if isinstance(blob, dict) and "topics" in blob and "base" in blob:
-        return {"Wyndham City Council": blob}
-    return blob if isinstance(blob, dict) else {}
+def _council_links(council: str, topic: str) -> List[Dict[str, str]]:
+    council = (council or "").lower().strip() or "wyndham"
+    topic = (topic or "general info").lower()
+    bank = COUNCIL_LINKS.get(council, {})
+    links = bank.get(topic, []) + bank.get("general info", [])
+    # Deduplicate by URL
+    seen = set()
+    uniq = []
+    for l in links:
+        url = l.get("url")
+        if url and url not in seen:
+            seen.add(url)
+            uniq.append(l)
+    return uniq[:8]
 
-def _load_catalog():
-    catalog = BUILTIN_CATALOG
-    if os.path.exists(CATALOG_PATH):
-        try:
-            with open(CATALOG_PATH, "r") as f:
-                file_cat = json.load(f)
-            file_cat = _normalize_catalog_blob(file_cat)
-            catalog = _deep_merge(catalog, file_cat)  # file overrides built-in
-        except Exception:
-            pass
-    return catalog
-
-# ---------------------- RAG helpers ----------------------
-
-def _fetch_clean(url, max_chars=18000):
-    """Download and lightly clean page text so the model can quote from it."""
+# --------------------------
+# Retrieval layer (optional)
+# --------------------------
+def _load_retriever(council: str):
+    """Try to build a FAISS retriever. Returns (retriever, embeddings) or (None, None) on failure."""
+    if not (_LANGCHAIN_OK and OPENAI_API_KEY):
+        return None, None
     try:
-        r = requests.get(url, timeout=FETCH_TIMEOUT, headers={"User-Agent": USER_AGENT})
-        if r.status_code != 200 or not r.text:
-            return ""
-        # robust parser; falls back to html.parser if html5lib is not available
-        parser = "html5lib"
-        try:
-            soup = BeautifulSoup(r.text, parser)
-        except Exception:
-            soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script", "style", "noscript", "svg"]):
-            t.decompose()
-        text = soup.get_text(" ").strip()
-        text = re.sub(r"\s+", " ", text)
-        return text[:max_chars]
+        idx_dir = os.path.join(INDEX_ROOT, council.lower())
+        index_path = os.path.join(idx_dir, "index.faiss")
+        if not os.path.exists(index_path):
+            return None, None
+        emb = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        store = FAISSStore.load_local(idx_dir, emb, allow_dangerous_deserialization=True)
+        return store.as_retriever(search_kwargs={"k": 6}), emb
     except Exception:
-        return ""
+        return None, None
 
-def _llm_grounded_answer(question, council, links):
-    """
-    Ask the model to answer using only the provided link texts.
-    If key/model missing — or we can’t extract content — returns "".
-    """
-    if not client or not links:
-        return ""
-
-    # Fetch text from the top 2–3 links
-    contexts = []
-    for link in links[:3]:
-        txt = _fetch_clean(link.get("url", ""))
-        if txt:
-            contexts.append({
-                "title": link.get("title", "Council page"),
-                "url": link.get("url", ""),
-                "text": txt[:8000]  # keep prompt compact
+def _retrieve_snippets(query: str, council: str) -> List[Dict[str, str]]:
+    """Return a list of snippets: {"text": ..., "source": ..., "title": ...}"""
+    ret, _ = _load_retriever(council)
+    if not ret:
+        return []
+    try:
+        docs = ret.get_relevant_documents(query)
+        out = []
+        for d in docs:
+            meta = getattr(d, "metadata", {}) or {}
+            out.append({
+                "text": d.page_content or "",
+                "source": meta.get("source") or meta.get("url") or "",
+                "title": meta.get("title") or "",
             })
-
-    if not contexts:
-        return ""
-
-    system = (
-        "You are a council customer-service assistant. "
-        "Answer the user's question using ONLY the provided council pages. "
-        "Be concise (2–5 sentences). If the answer is not clearly present, "
-        "say you can't confirm and suggest the most relevant link. "
-        "No policy promises; no made-up facts."
-    )
-
-    ctx_parts = []
-    for i, c in enumerate(contexts, 1):
-        ctx_parts.append(f"[{i}] {c['title']} — {c['url']}\n{c['text']}\n")
-    ctx = "\n\n".join(ctx_parts)
-
-    user = (
-        "Council: " + council + "\n"
-        "Question: " + (question or "") + "\n\n"
-        "Sources:\n" + ctx + "\n\n"
-        "Instructions: Answer strictly from the Sources. "
-        "If uncertain, say so and point the user to the best link."
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        return text
+        return out
     except Exception:
-        return ""
+        return []
 
-# ---------------------- Public API ----------------------
+def _links_from_snippets(snips: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    links: List[Dict[str, str]] = []
+    seen = set()
+    for s in snips:
+        url = (s.get("source") or "").strip()
+        if url and url not in seen and (url.startswith("http://") or url.startswith("https://")):
+            seen.add(url)
+            title = s.get("title") or "Source"
+            links.append({"title": title, "url": url})
+    return links
 
-def answer(email_text, council_name):
-    """
-    Produce an Outlook-safe HTML body and a list of human-readable citations.
-    """
-    catalog = _load_catalog()
+# --------------------------
+# Optional LLM fusion (nice wording when available)
+# --------------------------
+SYSTEM_EMAIL = """You are a concise council information assistant.
+You produce short, helpful HTML suitable for an email reply.
+Use bullet points or a short ordered list, and avoid fluff.
+If collection days depend on an address, say to use the official lookup tool.
+Never fabricate URLs; if unsure, keep links generic to the council's waste/rates/libraries pages."""
 
-    # Pick council
-    if council_name in catalog:
-        council = catalog[council_name]
-    elif "wyndham" in (council_name or "").lower():
-        council = catalog.get("Wyndham City Council", {})
-        council_name = "Wyndham City Council"
-    else:
-        body = (
-            "<p>Thanks for contacting " + html.escape(council_name) + ".</p>"
-            "<p>We’ll escalate this to an officer and follow up shortly.</p>"
+def _llm_summarize(query: str, topic: str, suburb: Optional[str], snippets: List[Dict[str, str]]) -> Optional[str]:
+    if not (_LANGCHAIN_OK and OPENAI_API_KEY):
+        return None
+    try:
+        # Prefer ChatOpenAI via langchain_openai
+        llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=OPENAI_API_KEY)
+        context = "\n\n".join(
+            f"[{i+1}] {s.get('text','')[:1200]}" for i, s in enumerate(snippets[:6])
         )
-        return body, []
+        suburb_line = f"User suburb context: {suburb}." if suburb else "User suburb context: (not provided)."
+        msg = [
+            {"role": "system", "content": SYSTEM_EMAIL},
+            {"role": "user", "content": f"Topic: {topic}\n{suburb_line}\n\nUser email:\n{query}\n\nContext (snippets):\n{context}\n\nWrite a short HTML reply (2–6 bullets)."}
+        ]
+        res = llm.invoke(msg)
+        content = getattr(res, "content", None)
+        if content and isinstance(content, str):
+            return content.strip()
+    except Exception:
+        pass
+    # Fallback to plain template
+    return None
 
-    topics_map = council.get("topics", {}) or {}
-    wanted = _classify(email_text)
-
-    # Prefer booking page when explicitly asked to "book" hard rubbish
-    if "hard_waste" in wanted and "book_hard_waste" in topics_map:
-        if re.search(r"\bbook(ing)?\b", (email_text or "").lower()):
-            wanted.insert(0, "book_hard_waste")
-
-    links = []
-    for key in wanted:
-        info = topics_map.get(key)
-        if info and info.get("url"):
-            links.append(info)
-
-    # Fallback to contact if no links matched
-    if not links and topics_map.get("contact"):
-        links.append(topics_map["contact"])
-
-    # --- Try a grounded AI answer from the matched pages
-    ai_text = _llm_grounded_answer(email_text or "", council_name, links)
-    ai_html = ""
-    if ai_text:
-        ai_html = (
-            "<div style='padding:12px 14px; background:#f1f5f9; "
-            "border-left:3px solid #0ea5e9; border-radius:6px; margin:0 0 12px 0;'>"
-            + html.escape(ai_text).replace("\n", "<br>")
-            + "</div>"
+# --------------------------
+# HTML builders
+# --------------------------
+def _wrap_email_html(user_text: str, body_html: str, links: List[Dict[str, str]]) -> str:
+    # Sanitize & assemble
+    links_html = ""
+    if links:
+        items = "".join(
+            f'<li><a href="{html.escape(l["url"], quote=True)}">{html.escape(l["title"])}</a></li>'
+            for l in links[:8]
         )
+        links_html = f"<p><strong>Official links:</strong></p><ul>{items}</ul>"
 
-    # --- Fallback one-liner (topic-specific) embedding the first link
-    response_html = ""
-    primary = links[0] if links else None
-    if not ai_html and primary:
-        for key in wanted:
-            if key in TOPIC_RESPONSES:
-                anchor = (
-                    "<a href='" + html.escape(primary["url"]) + "'>"
-                    + html.escape(primary["title"]) + "</a>"
-                )
-                # Replace {link} placeholder inside the sentence
-                sentence_template = TOPIC_RESPONSES[key]
-                sentence = sentence_template.replace("{link}", anchor)
-                response_html = "<p style='margin:0 0 10px 0;'>" + sentence + "</p>"
-                break
+    return f"""
+<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5">
+  {body_html}
+  {links_html}
+  <hr>
+  <p style="color:#777;margin-top:14px">Original question:</p>
+  <blockquote style="margin:0 0 0 1em;color:#555;border-left:3px solid #ddd;padding-left:.8em">{html.escape(_strip_html(user_text))}</blockquote>
+</div>
+""".strip()
 
-    # --- Helper snippet line (if still nothing)
-    helper_html = ""
-    if not ai_html and not response_html:
-        for key in wanted:
-            if key in TOPIC_SNIPPETS:
-                helper_html = (
-                    "<p style='margin:0 0 10px 0;'>" + html.escape(TOPIC_SNIPPETS[key]) + "</p>"
-                )
-                break
+def _topic_intro(topic: str, suburb: Optional[str]) -> str:
+    if topic == "waste" and suburb:
+        return f"<p>For <strong>{html.escape(suburb)}</strong>, here’s how to confirm your collection day and what to do next.</p>"
+    # Generic one-liners per topic could be added here
+    return ""
 
-    # Build Outlook-safe HTML
-    snippet = html.escape((email_text or "").strip()[:900]).replace("\n", "<br>")
-    lis = "".join(
-        "<li><a href='" + html.escape(x["url"]) + "'>" + html.escape(x["title"]) + "</a></li>"
-        for x in links[:MAX_LINKS]
-    )
+# --------------------------
+# Public API
+# --------------------------
+def answer(query: str, topic: Optional[str] = None, council: str = "wyndham", format: str = "email") -> Dict[str, object]:
+    """
+    Returns:
+      {
+        "answer_html": "<p>...</p>",
+        "links": [{"title": "...", "url": "..."}, ...]
+      }
+    """
+    try:
+        topic_final = (topic or _pick_topic_heuristic(query)).lower()
+        suburb, pc = _detect_suburb_and_postcode(query)
 
-    intro_block = (
-        ai_html
-        or response_html
-        or helper_html
-        or "<p style='margin:0 0 10px 0;'>Based on your enquiry, these links should help:</p>"
-    )
+        # Try to retrieve supporting snippets + links
+        snippets = _retrieve_snippets(query, council)
+        rag_links = _links_from_snippets(snippets)
 
-    body = (
-        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
-        "style=\"font-family: Arial, 'Segoe UI', sans-serif; color:#0f172a; line-height:1.55;\">"
-        "<tr><td style='padding:20px; border:1px solid #e5e7eb; border-radius:12px;'>"
-        "<div style='font-size:18px; font-weight:700;'>" + html.escape(council_name) + "</div>"
-        "<div style='font-size:12px; color:#64748b; margin-top:2px;'>Auto-drafted reply — please review before sending</div>"
-        "<hr style='border:none; border-top:1px solid #e5e7eb; margin:12px 0 16px 0;'>"
-        + intro_block +
-        "<ul style='margin:0 0 14px 18px; padding:0;'>" + (lis or "<li>We’ll escalate this to the right team.</li>") + "</ul>"
-        "<p style='margin:0 0 10px 0;'>Your message:</p>"
-        "<blockquote style='margin:0; padding:12px 14px; background:#f8fafc; border-left:3px solid #0ea5e9; border-radius:6px;'>"
-        + snippet + "</blockquote>"
-        "<p style='margin:16px 0 0 0;'>Kind regards,<br>Customer Service Team</p>"
-        "</td></tr></table>"
-    )
+        # If LLM available, try to produce a concise HTML
+        llm_html = _llm_summarize(query=query, topic=topic_final, suburb=suburb, snippets=snippets)
 
-    citations = [
-        (x.get("title", "Council page") + " | " + x.get("url", ""))
-        for x in links[:MAX_LINKS]
-    ]
-    return body, citations
+        # Fallback body from templates
+        template_html = TOPIC_TEMPLATES.get(topic_final, TOPIC_TEMPLATES["general info"])
+        intro = _topic_intro(topic_final, suburb)
+        body_html = llm_html or (intro + template_html)
+
+        # Merge curated links with any RAG sources (curated first)
+        curated = _council_links(council, topic_final)
+        # Keep curated order; append RAG links that are new
+        seen = {l["url"] for l in curated}
+        merged_links = list(curated)
+        for l in rag_links:
+            if l["url"] not in seen:
+                seen.add(l["url"])
+                merged_links.append(l)
+
+        # Ensure at least something present
+        if not merged_links:
+            merged_links = _council_links(council, "general info")
+
+        html_email = _wrap_email_html(user_text=query, body_html=body_html, links=merged_links)
+
+        return {
+            "answer_html": html_email if format == "email" else body_html,
+            "links": merged_links,
+            # Optional debug fields (not required by worker). Uncomment if you want them.
+            # "topic": topic_final,
+            # "suburb": suburb,
+            # "snippets_used": len(snippets),
+        }
+
+    except Exception as e:
+        # Absolute safety fallback
+        traceback.print_exc()
+        fallback_links = _council_links(council, "general info")
+        return {
+            "answer_html": """
+<p>Thanks for your email. Here’s information relevant to your question:</p>
+<ul>
+  <li>Browse the council’s Services page for waste, pets, permits, rates, and more.</li>
+  <li>If you are asking about collection days or opening hours, please include your suburb (and postcode) for faster help.</li>
+</ul>
+""".strip(),
+            "links": fallback_links or [{"title": "Council Services", "url": "https://www.wyndham.vic.gov.au/services"}],
+        }
+
+
+# --------------------------
+# Optional: simple CLI test
+# --------------------------
+if __name__ == "__main__":
+    test_q = """Hi team,
+I'm a Wyndham resident. What day is general waste and recycling collected for Hoppers Crossing (3029)?
+Please include the official Wyndham links and what to do if a collection is missed.
+Thanks!"""
+    out = answer(test_q, topic=None, council="wyndham", format="email")
+    print("---- HTML ----")
+    print(out["answer_html"][:1000], "...\n")
+    print("---- LINKS ----")
+    for l in out["links"]:
+        print("-", l["title"], "=>", l["url"])
