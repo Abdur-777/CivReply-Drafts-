@@ -1,5 +1,5 @@
 """
-drafts_module.py — CivReply Drafts (vertical steps)
+drafts_module.py — CivReply Drafts (vertical, progressive steps)
 - Paste-mode works without credentials.
 - Optional Outlook send via Microsoft Graph /sendMail.
 - Answers come from a retriever function you pass in (e.g., retriever_catalog.answer).
@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import requests
 import streamlit as st
 import streamlit.components.v1 as components  # for components.html
+
 
 # ======================
 # Graph Client (robust)
@@ -79,7 +80,7 @@ class GraphClient:
             self._acquire_token()
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
-    # Optional inbox helpers (not used in vertical flow, kept for future)
+    # Optional inbox helpers (kept for future use)
     def list_inbox(self, top: int = 25) -> List[Dict]:
         if not self.enabled:
             return []
@@ -127,7 +128,7 @@ class GraphClient:
             return False
         return True
 
-    # Reply helpers (kept for compatibility if you want thread replies later)
+    # Reply helpers (not used in this vertical flow but left for compatibility)
     def create_reply_draft(self, message_id: str, reply_html: str, comment: Optional[str] = None) -> Optional[str]:
         if not self.enabled:
             return None
@@ -165,7 +166,6 @@ class GraphClient:
 # Helpers & Policy
 # ==================
 
-# Lowercased triggers to match a lowercased body
 GREEN_KEYWORDS = [
     "bin","waste","hard rubbish","green waste","opening hours","rates notice",
     "parking permit","pets","dogs","cats","fee","application form","contact number",
@@ -275,7 +275,7 @@ def build_cited_reply(
 
 
 # ==============
-# Streamlit UI (vertical steps)
+# Streamlit UI (vertical; steps 2 & 3 appear under step 1 after draft)
 # ==============
 
 def render_drafts_ui(
@@ -285,7 +285,6 @@ def render_drafts_ui(
     st.header("📬 CivReply Drafts")
     st.caption("Link-first, cited email drafts for Victorian councils — auto-send only when it’s safe.")
 
-    # basic styling for vertical steps
     st.markdown(
         """
         <style>
@@ -299,10 +298,12 @@ def render_drafts_ui(
     councils = councils or ["Wyndham City Council", "Yarra City Council", "City of Melbourne"]
     graph = GraphClient()
 
-    # Keep preview in session so step 2/3 stay visible after "Generate draft"
-    if "civreply_draft_html" not in st.session_state:
-        st.session_state["civreply_draft_html"] = ""
-        st.session_state["civreply_citations"] = []
+    # session state
+    draft_key = "civreply_draft_html"
+    cites_key = "civreply_citations"
+    if draft_key not in st.session_state:
+        st.session_state[draft_key] = ""
+        st.session_state[cites_key] = []
         st.session_state["civreply_subject"] = ""
         st.session_state["civreply_risk"] = "GREEN"
         st.session_state["civreply_risk_reasons"] = []
@@ -310,98 +311,84 @@ def render_drafts_ui(
     # ----------------------------
     # STEP 1 — Paste an email
     # ----------------------------
-    with st.container():
-        st.markdown('<div class="step"><h3>1) Paste an email (subject + body)</h3>', unsafe_allow_html=True)
+    st.markdown('<div class="step"><h3>1) Paste an email (subject + body)</h3>', unsafe_allow_html=True)
+    council_name = st.selectbox("Council", councils, index=0)
+    subj = st.text_input(
+        "Email subject",
+        value=st.session_state.get("civreply_subject", "Wyndham – Bin collection day for Hoppers Crossing"),
+    )
+    if st.button("Insert example"):
+        st.session_state["email_body"] = (
+            "Hi team,\n"
+            "I’m a Wyndham resident. What day is general waste and recycling collected for Hoppers Crossing (3029)? "
+            "Please include the official Wyndham links and what to do if a collection is missed.\n"
+            "Thanks!"
+        )
+    body = st.text_area("Email body", key="email_body", height=180, placeholder="Paste the customer's email here…")
 
-        council_name = st.selectbox("Council", councils, index=0)
-
-        col_a, col_b = st.columns([0.7, 0.3])
-        with col_a:
-            subj = st.text_input("Email subject", value=st.session_state.get("civreply_subject", "Wyndham – Bin collection day for Hoppers Crossing"))
-        with col_b:
-            if st.button("Insert example"):
-                st.session_state["email_body"] = (
-                    "Hi team,\n"
-                    "I’m a Wyndham resident. What day is general waste and recycling collected for Hoppers Crossing (3029)? "
-                    "Please include the official Wyndham links and what to do if a collection is missed.\n"
-                    "Thanks!"
-                )
-
-        body = st.text_area("Email body", key="email_body", height=180, placeholder="Paste the customer's email here…")
-
-        if st.button("✨ Generate draft"):
-            full_text = f"Subject: {subj}\n\n{body}".strip()
-            if not full_text:
-                st.warning("Please enter a subject or body.")
-            else:
-                # classify risk for info
-                risk, reasons = classify_risk(full_text)
-                st.session_state["civreply_risk"] = risk
-                st.session_state["civreply_risk_reasons"] = reasons
-                st.session_state["civreply_subject"] = subj
-
-                html_body, citations = build_cited_reply(full_text, council_name, get_answer_fn)
-                st.session_state["civreply_draft_html"] = html_body
-                st.session_state["civreply_citations"] = citations
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ----------------------------
-    # STEP 2 — Preview & export
-    # ----------------------------
-    with st.container():
-        st.markdown('<div class="step"><h3>2) Preview & export</h3>', unsafe_allow_html=True)
-
-        html_body = st.session_state["civreply_draft_html"]
-        if not html_body:
-            st.info("Generate a draft to preview here.")
+    if st.button("✨ Generate draft"):
+        full_text = f"Subject: {subj}\n\n{body}".strip()
+        if not full_text:
+            st.warning("Please enter a subject or body.")
         else:
-            st.write(f"Risk level: **{st.session_state['civreply_risk']}** — {', '.join(st.session_state['civreply_risk_reasons'])}")
-            components.html(
-                f"<div style='font-family:sans-serif; padding:8px'>{html_body}</div>",
-                height=480, scrolling=True
-            )
-            st.download_button(
-                "⬇️ Download .html",
-                data=html_body.encode("utf-8"),
-                file_name="reply_draft.html",
-                mime="text/html",
-            )
-            if st.session_state["civreply_citations"]:
-                with st.expander("Citations"):
-                    for c in st.session_state["civreply_citations"]:
-                        st.write("•", c)
+            risk, reasons = classify_risk(full_text)
+            st.session_state["civreply_risk"] = risk
+            st.session_state["civreply_risk_reasons"] = reasons
+            st.session_state["civreply_subject"] = subj
 
-        st.markdown("</div>", unsafe_allow_html=True)
+            html_body, citations = build_cited_reply(full_text, council_name, get_answer_fn)
+            st.session_state[draft_key] = html_body
+            st.session_state[cites_key] = citations
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # show steps 2 & 3 ONLY after draft exists
+    ready = bool(st.session_state[draft_key])
+    if not ready:
+        st.info("Generate a draft above to reveal steps 2 and 3.")
+        return
 
     # ----------------------------
-    # STEP 3 — (Optional) Send via Outlook
+    # STEP 2 — Preview & export (UNDER step 1)
     # ----------------------------
-    with st.container():
-        st.markdown('<div class="step"><h3>3) (Optional) Send via Outlook</h3>', unsafe_allow_html=True)
+    st.markdown('<div class="step"><h3>2) Preview & export</h3>', unsafe_allow_html=True)
+    st.write(f"Risk level: **{st.session_state['civreply_risk']}** — {', '.join(st.session_state['civreply_risk_reasons'])}")
+    components.html(
+        f"<div style='font-family:sans-serif; padding:8px'>{st.session_state[draft_key]}</div>",
+        height=480, scrolling=True
+    )
+    st.download_button(
+        "⬇️ Download .html",
+        data=st.session_state[draft_key].encode("utf-8"),
+        file_name="reply_draft.html",
+        mime="text/html",
+    )
+    if st.session_state[cites_key]:
+        with st.expander("Citations"):
+            for c in st.session_state[cites_key]:
+                st.write("•", c)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if not graph.enabled:
-            st.caption("Configure GRAPH_* env vars to enable sending: Mail.Send permission and a mailbox.")
-        to_addr = st.text_input("To (recipient)")
-        cc_line = st.text_input("CC (comma-separated)")
-
-        disabled = not (graph.enabled and st.session_state["civreply_draft_html"] and to_addr.strip())
-        if st.button("Send now via Outlook ✉️", disabled=disabled):
-            try:
-                ok = graph.send_mail(
-                    subject=st.session_state.get("civreply_subject") or "Re: your enquiry",
-                    html_body=st.session_state["civreply_draft_html"],
-                    to=to_addr.strip(),
-                    cc=[x.strip() for x in cc_line.split(",") if x.strip()],
-                )
-                if ok:
-                    st.success("Sent ✔️ (saved to Sent Items)")
-                else:
-                    st.error("Send failed. Check app permissions (Mail.Send) and credentials.")
-            except Exception as e:
-                st.exception(e)
-
-        st.markdown("</div>", unsafe_allow_html=True)
+    # ----------------------------
+    # STEP 3 — (Optional) Send via Outlook (UNDER step 2)
+    # ----------------------------
+    st.markdown('<div class="step"><h3>3) (Optional) Send via Outlook</h3>', unsafe_allow_html=True)
+    if not graph.enabled:
+        st.caption("Configure GRAPH_* env vars to enable sending: Mail.Send permission and a mailbox.")
+    to_addr = st.text_input("To (recipient)")
+    cc_line = st.text_input("CC (comma-separated)")
+    disabled = not (graph.enabled and to_addr.strip())
+    if st.button("Send now via Outlook ✉️", disabled=disabled):
+        try:
+            ok = graph.send_mail(
+                subject=st.session_state.get("civreply_subject") or "Re: your enquiry",
+                html_body=st.session_state[draft_key],
+                to=to_addr.strip(),
+                cc=[x.strip() for x in cc_line.split(",") if x.strip()],
+            )
+            st.success("Sent ✔️ (saved to Sent Items)" if ok else "Send failed.")
+        except Exception as e:
+            st.exception(e)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.caption(
         "Notes:\n"
