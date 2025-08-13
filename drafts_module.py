@@ -1,5 +1,5 @@
 """
-drafts_module.py — Microsoft Graph + Streamlit (uniqueBody + HTML preview)
+Drafts Module — Microsoft Graph + Streamlit (uniqueBody + HTML preview)
 
 Paste-mode: generate a reply draft from pasted text.
 Outlook mode: list inbox via Graph, show message preview, create reply drafts, optional auto-send for GREEN.
@@ -15,16 +15,16 @@ from __future__ import annotations
 import os
 import re
 import json
-import html
-from typing import Callable, Dict, List, Optional, Tuple
+import html as _html
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components  # for components.html
 
-# ===============
-# Graph Client
-# ===============
+# ======================
+# Graph Client (robust)
+# ======================
 
 class GraphClient:
     def __init__(
@@ -52,16 +52,20 @@ class GraphClient:
         if not self.enabled:
             st.info("Graph not configured (missing: %s). Paste-mode still works." % ", ".join(missing))
 
+    # --- low-level ---
+    @property
+    def _token_url(self) -> str:
+        return f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+
     def _acquire_token(self) -> Optional[str]:
         try:
-            token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
             data = {
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
                 "grant_type": "client_credentials",
                 "scope": "https://graph.microsoft.com/.default",
             }
-            resp = requests.post(token_url, data=data, timeout=15)
+            resp = requests.post(self._token_url, data=data, timeout=20)
             if resp.ok:
                 self.token = resp.json().get("access_token")
                 return self.token
@@ -71,20 +75,35 @@ class GraphClient:
             st.exception(e)
             return None
 
-    def _headers(self) -> Dict[str, str]:
+    def _auth_headers(self) -> Dict[str, str]:
         if not self.token:
             self._acquire_token()
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+
+    def _request(self, method: str, url: str, **kw) -> requests.Response:
+        """Make a Graph request, refresh token once on 401, and return the response."""
+        if not self.enabled:
+            raise RuntimeError("Graph not configured")
+        headers = kw.pop("headers", None) or self._auth_headers()
+        r = requests.request(method.upper(), url, headers=headers, timeout=20, **kw)
+        if r.status_code == 401:  # token expired → refresh once
+            self._acquire_token()
+            headers = self._auth_headers()
+            r = requests.request(method.upper(), url, headers=headers, timeout=20, **kw)
+        return r
+
+    # --- high-level ---
+    _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
     def list_inbox(self, top: int = 25) -> List[Dict]:
         if not self.enabled:
             return []
         url = (
-            f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/mailFolders/Inbox/messages"
+            f"{self._GRAPH_BASE}/users/{self.mailbox_address}/mailFolders/Inbox/messages"
             f"?$top={top}&$orderby=receivedDateTime desc"
-            f"&$select=id,subject,from,receivedDateTime,hasAttachments,conversationId"
+            f"&$select=id,subject,from,receivedDateTime,hasAttachments,conversationId,isRead"
         )
-        r = requests.get(url, headers=self._headers(), timeout=20)
+        r = self._request("GET", url)
         if not r.ok:
             st.error(f"Graph list_inbox failed: {r.status_code} {r.text[:300]}")
             return []
@@ -95,10 +114,10 @@ class GraphClient:
         if not self.enabled:
             return None
         url = (
-            f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/messages/{message_id}"
+            f"{self._GRAPH_BASE}/users/{self.mailbox_address}/messages/{message_id}"
             f"?$select=subject,body,bodyPreview,uniqueBody"
         )
-        r = requests.get(url, headers=self._headers(), timeout=20)
+        r = self._request("GET", url)
         if not r.ok:
             st.error(f"Graph get_message failed: {r.status_code} {r.text[:300]}")
             return None
@@ -108,9 +127,9 @@ class GraphClient:
         if not self.enabled:
             return None
         # 1) create reply draft
-        url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/messages/{message_id}/createReply"
+        url = f"{self._GRAPH_BASE}/users/{self.mailbox_address}/messages/{message_id}/createReply"
         payload = {"comment": comment or ""}
-        r = requests.post(url, headers=self._headers(), data=json.dumps(payload), timeout=20)
+        r = self._request("POST", url, data=json.dumps(payload))
         if not r.ok:
             st.error(f"Graph createReply failed: {r.status_code} {r.text[:300]}")
             return None
@@ -120,9 +139,9 @@ class GraphClient:
             st.error("Graph createReply returned no draft id.")
             return None
         # 2) patch our HTML body
-        patch_url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/messages/{draft_id}"
+        patch_url = f"{self._GRAPH_BASE}/users/{self.mailbox_address}/messages/{draft_id}"
         patch_body = {"body": {"contentType": "HTML", "content": reply_html}}
-        r2 = requests.patch(patch_url, headers=self._headers(), data=json.dumps(patch_body), timeout=20)
+        r2 = self._request("PATCH", patch_url, data=json.dumps(patch_body))
         if not r2.ok:
             st.error(f"Graph patch draft failed: {r2.status_code} {r2.text[:300]}")
             return None
@@ -131,8 +150,8 @@ class GraphClient:
     def send_draft(self, draft_id: str) -> bool:
         if not self.enabled:
             return False
-        url = f"https://graph.microsoft.com/v1.0/users/{self.mailbox_address}/messages/{draft_id}/send"
-        r = requests.post(url, headers=self._headers(), timeout=20)
+        url = f"{self._GRAPH_BASE}/users/{self.mailbox_address}/messages/{draft_id}/send"
+        r = self._request("POST", url)
         if not r.ok:
             st.error(f"Graph send draft failed: {r.status_code} {r.text[:300]}")
             return False
@@ -142,6 +161,7 @@ class GraphClient:
 # Helpers & Policy
 # ==================
 
+# Lowercased triggers to match a lowercased body
 GREEN_KEYWORDS = [
     "bin","waste","hard rubbish","green waste","opening hours","rates notice",
     "parking permit","pets","dogs","cats","fee","application form","contact number",
@@ -152,7 +172,7 @@ AMBER_TRIGGERS = [
     "deadline","urgent","threat","media","ombudsman","privacy"
 ]
 RED_TRIGGERS = [
-    "FOI","freedom of information","accident","injury","legal","threaten","assault",
+    "foi","freedom of information","accident","injury","legal","threaten","assault",
     "payment dispute","chargeback","personal information request","vulnerable","danger"
 ]
 PII_PATTERNS = [
@@ -175,47 +195,82 @@ def classify_risk(text: str) -> Tuple[str, List[str]]:
         reasons.append("No risk triggers detected")
     return risk, reasons
 
-def default_reply(email_text: str, council_name: str, citations: Optional[List[str]] = None) -> str:
-    intro = f"<p>Thanks for contacting {html.escape(council_name)}.</p>"
+# -------- Draft building --------
+
+def _default_reply(email_text: str, council_name: str, links: Optional[List[Dict[str,str]]] = None) -> str:
+    intro = f"<p>Thanks for contacting {_html.escape(council_name)}.</p>"
     body = (
         "<p>We received your enquiry and will get back to you with more detail soon. "
         "For common questions about services, permits, rates, and waste collection, "
         "please see the links below.</p>"
     )
-    cites = citations or ["General services | https://www.wyndham.vic.gov.au/services | Overview"]
-    cite_html = "".join(f"<li>{html.escape(c)}</li>" for c in cites)
+    links = links or [{"title": f"{council_name} services", "url": f"https://www.{council_name.lower().split()[0]}.vic.gov.au/services"}]
+    items = "".join(f"<li><a href=\"{_html.escape(l['url'])}\">{_html.escape(l['title'])}</a></li>" for l in links if l.get("url"))
     footer = (
         "<p>Kind regards,<br/>Customer Service Team</p>"
         "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
     )
-    return f"{intro}{body}<ul>{cite_html}</ul>{footer}"
+    return f"{intro}{body}<ul>{items}</ul>{footer}"
+
+GetAnswerReturn = Union[Tuple[str, List[str]], Dict[str, object], str]
+
 
 def build_cited_reply(
     email_text: str,
     council_name: str,
-    get_answer_fn: Optional[Callable[[str, str], Tuple[str, List[str]]]] = None,
+    get_answer_fn: Optional[Callable[[str, str], GetAnswerReturn]] = None,
 ) -> Tuple[str, List[str]]:
+    """Return (html_body, citations_as_strings). Accepts multiple return shapes from get_answer_fn:
+    - (html, [citations])
+    - {"answer_html": html, "links": [{"title":..., "url":...}]}
+    - "html string"
+    """
     try:
         if get_answer_fn:
-            html_body, citations = get_answer_fn(email_text, council_name)
-            if not isinstance(html_body, str):
-                html_body = str(html_body)
-            citations = citations or []
-            html_body += "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
-            return html_body, citations
-        return default_reply(email_text, council_name), [
-            f"{council_name} services | https://www.{council_name.lower().split()[0]}.vic.gov.au/ | Overview"
-        ]
+            res = get_answer_fn(email_text, council_name)
+            # Case A: tuple(html, citations)
+            if isinstance(res, (list, tuple)) and len(res) >= 1:
+                html_body = str(res[0])
+                citations = []
+                if len(res) >= 2 and isinstance(res[1], (list, tuple)):
+                    citations = [str(x) for x in res[1]]
+                html_body += "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
+                return html_body, citations
+            # Case B: dict with answer_html/links
+            if isinstance(res, dict):
+                html_body = str(res.get("answer_html") or res.get("html") or "")
+                links = res.get("links") or []
+                citations = []
+                for l in links:
+                    if isinstance(l, dict) and l.get("url"):
+                        title = l.get("title") or l["url"]
+                        citations.append(f"{title} | {l['url']}")
+                    elif isinstance(l, str):
+                        citations.append(l)
+                if not html_body:
+                    html_body = _default_reply(email_text, council_name, links=[{"title": council_name+" services", "url": f"https://www.{council_name.lower().split()[0]}.vic.gov.au/services"}])
+                if "Auto-drafted reply" not in html_body:
+                    html_body += "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
+                return html_body, citations
+            # Case C: plain html string
+            if isinstance(res, str):
+                html_body = res
+                html_body += "<p><em>Auto-drafted reply. Please review before sending.</em></p>"
+                return html_body, []
+        # Fallback: generic reply
+        html_body = _default_reply(email_text, council_name)
+        return html_body, [f"{council_name} services | https://www.{council_name.lower().split()[0]}.vic.gov.au/services"]
     except Exception as e:
         st.warning(f"Reply generation failed; using fallback. Error: {e}")
-        return default_reply(email_text, council_name), []
+        html_body = _default_reply(email_text, council_name)
+        return html_body, []
 
 # ==============
 # Streamlit UI
 # ==============
 
 def render_drafts_ui(
-    get_answer_fn: Optional[Callable[[str, str], Tuple[str, List[str]]]] = None,
+    get_answer_fn: Optional[Callable[[str, str], GetAnswerReturn]] = None,
     councils: Optional[List[str]] = None,
 ):
     st.header("📬 Inbox AI — Drafts")
