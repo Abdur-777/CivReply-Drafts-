@@ -1,15 +1,32 @@
-# retriever_catalog.py — link-first answers (Wyndham built-in) — Python 3.8+
+# retriever_catalog.py — link-grounded answers (Wyndham built-in) — Python 3.8+
 # Returns (html_body, citations) given (email_text, council_name)
-# - Uses catalog.json if present; falls back to built-in Wyndham map.
-# - No external APIs required.
+# - Uses catalog.json if present; merges with a built-in Wyndham map.
+# - Classifies the enquiry → picks the most relevant Wyndham pages.
+# - (Optional) If OPENAI_API_KEY is set, generates a short answer strictly from those pages (RAG).
+# - No risky promises; if uncertain, it points to the best link.
 
 import os
 import json
 import re
 import html
+import requests
+from bs4 import BeautifulSoup
+
+# Optional LLM grounding (enabled if OPENAI_API_KEY is present)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+    except Exception:
+        client = None  # fail gracefully if library missing
 
 CATALOG_PATH = "catalog.json"
 MAX_LINKS = 6
+FETCH_TIMEOUT = 18
+USER_AGENT = "Mozilla/5.0 CivReply"
 
 # ---------------- Built-in catalog: Wyndham ----------------
 BUILTIN_CATALOG = {
@@ -192,7 +209,7 @@ BUILTIN_CATALOG = {
 }
 # -----------------------------------------------------------
 
-# Short helper lines per topic (shown above the links)
+# Short helper lines per topic (shown above the links if AI answer not available)
 TOPIC_SNIPPETS = {
     "find_bin_day": "You can check your collection day online and confirm upcoming bin schedules.",
     "book_hard_waste": "You can lodge a hard & green waste booking online and see the accepted items list.",
@@ -222,6 +239,24 @@ TOPIC_SNIPPETS = {
     "foi": "Request access to information under Freedom of Information.",
     "privacy": "Council’s privacy policy explains how your information is handled.",
     "contact": "If you need something else, contact details and hours are here.",
+}
+
+# One-liner responses per topic. {link} is replaced with a clickable URL (fallback if AI is off).
+TOPIC_RESPONSES = {
+    "find_bin_day": "You can look up your collection day by address here: {link}.",
+    "book_hard_waste": "You can book a hard & green waste collection and see accepted items and limits: {link}.",
+    "bin_requests": "For new, damaged, stolen or missed bins, use the bin services form: {link}.",
+    "fogo": "Your green-lid (FOGO) bin accepts food and garden organics — details here: {link}.",
+    "rates_pay": "You can pay your rates online and see payment options and due dates: {link}.",
+    "rates_hardship": "If you’re having trouble paying, request hardship help or a payment plan here: {link}.",
+    "parking_fine_review": "To request a review or payment plan for an infringement, start here: {link}.",
+    "parking_fines_pay": "You can pay your infringement online here: {link}.",
+    "pet_registration": "Register or renew your dog/cat online (microchipping required): {link}.",
+    "report_issue": "Lodge a request or report an issue with Council here: {link}.",
+    "planning_permits": "When a planning permit is needed and how to apply: {link}.",
+    "building_permits": "When a building permit is required and next steps: {link}.",
+    "libraries": "Library locations, opening hours and catalogue: {link}.",
+    "contact": "If you need something else, our contact details and hours are here: {link}.",
 }
 
 # Classification rules: map email text → topic keys (order matters)
@@ -333,6 +368,87 @@ def _load_catalog():
             pass
     return catalog
 
+# ---------------------- RAG helpers ----------------------
+
+def _fetch_clean(url, max_chars=18000):
+    """Download and lightly clean page text so the model can quote from it."""
+    try:
+        r = requests.get(url, timeout=FETCH_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        if r.status_code != 200 or not r.text:
+            return ""
+        # robust parser; falls back to html.parser if html5lib is not available
+        parser = "html5lib"
+        try:
+            soup = BeautifulSoup(r.text, parser)
+        except Exception:
+            soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "noscript", "svg"]):
+            t.decompose()
+        text = soup.get_text(" ").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+def _llm_grounded_answer(question, council, links):
+    """
+    Ask the model to answer using only the provided link texts.
+    If key/model missing — or we can’t extract content — returns "".
+    """
+    if not client or not links:
+        return ""
+
+    # Fetch text from the top 2–3 links
+    contexts = []
+    for link in links[:3]:
+        txt = _fetch_clean(link.get("url", ""))
+        if txt:
+            contexts.append({
+                "title": link.get("title", "Council page"),
+                "url": link.get("url", ""),
+                "text": txt[:8000]  # keep prompt compact
+            })
+
+    if not contexts:
+        return ""
+
+    system = (
+        "You are a council customer-service assistant. "
+        "Answer the user's question using ONLY the provided council pages. "
+        "Be concise (2–5 sentences). If the answer is not clearly present, "
+        "say you can't confirm and suggest the most relevant link. "
+        "No policy promises; no made-up facts."
+    )
+
+    ctx_parts = []
+    for i, c in enumerate(contexts, 1):
+        ctx_parts.append(f"[{i}] {c['title']} — {c['url']}\n{c['text']}\n")
+    ctx = "\n\n".join(ctx_parts)
+
+    user = (
+        "Council: " + council + "\n"
+        "Question: " + (question or "") + "\n\n"
+        "Sources:\n" + ctx + "\n\n"
+        "Instructions: Answer strictly from the Sources. "
+        "If uncertain, say so and point the user to the best link."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text
+    except Exception:
+        return ""
+
+# ---------------------- Public API ----------------------
+
 def answer(email_text, council_name):
     """
     Produce an Outlook-safe HTML body and a list of human-readable citations.
@@ -347,8 +463,8 @@ def answer(email_text, council_name):
         council_name = "Wyndham City Council"
     else:
         body = (
-            f"<p>Thanks for contacting {html.escape(council_name)}.</p>"
-            f"<p>We’ll escalate this to an officer and follow up shortly.</p>"
+            "<p>Thanks for contacting " + html.escape(council_name) + ".</p>"
+            "<p>We’ll escalate this to an officer and follow up shortly.</p>"
         )
         return body, []
 
@@ -370,39 +486,75 @@ def answer(email_text, council_name):
     if not links and topics_map.get("contact"):
         links.append(topics_map["contact"])
 
-    # Helper line from first matching topic (if we have a snippet)
-    helper = None
-    for key in wanted:
-        if key in TOPIC_SNIPPETS:
-            helper = TOPIC_SNIPPETS[key]
-            break
-    helper_html = (
-        f"<p style='margin:0 0 10px 0;'>{html.escape(helper)}</p>" if helper else ""
-    )
+    # --- Try a grounded AI answer from the matched pages
+    ai_text = _llm_grounded_answer(email_text or "", council_name, links)
+    ai_html = ""
+    if ai_text:
+        ai_html = (
+            "<div style='padding:12px 14px; background:#f1f5f9; "
+            "border-left:3px solid #0ea5e9; border-radius:6px; margin:0 0 12px 0;'>"
+            + html.escape(ai_text).replace("\n", "<br>")
+            + "</div>"
+        )
+
+    # --- Fallback one-liner (topic-specific) embedding the first link
+    response_html = ""
+    primary = links[0] if links else None
+    if not ai_html and primary:
+        for key in wanted:
+            if key in TOPIC_RESPONSES:
+                anchor = (
+                    "<a href='" + html.escape(primary["url"]) + "'>"
+                    + html.escape(primary["title"]) + "</a>"
+                )
+                # Replace {link} placeholder inside the sentence
+                sentence_template = TOPIC_RESPONSES[key]
+                sentence = sentence_template.replace("{link}", anchor)
+                response_html = "<p style='margin:0 0 10px 0;'>" + sentence + "</p>"
+                break
+
+    # --- Helper snippet line (if still nothing)
+    helper_html = ""
+    if not ai_html and not response_html:
+        for key in wanted:
+            if key in TOPIC_SNIPPETS:
+                helper_html = (
+                    "<p style='margin:0 0 10px 0;'>" + html.escape(TOPIC_SNIPPETS[key]) + "</p>"
+                )
+                break
 
     # Build Outlook-safe HTML
     snippet = html.escape((email_text or "").strip()[:900]).replace("\n", "<br>")
     lis = "".join(
-        f"<li><a href='{html.escape(x['url'])}'>{html.escape(x['title'])}</a></li>"
+        "<li><a href='" + html.escape(x["url"]) + "'>" + html.escape(x["title"]) + "</a></li>"
         for x in links[:MAX_LINKS]
     )
 
-    body = f"""
-<table role="presentation" width="100%" cellspacing="0" cellpadding="0"
-       style="font-family: Arial, 'Segoe UI', sans-serif; color:#0f172a; line-height:1.55;">
-  <tr>
-    <td style="padding:20px; border:1px solid #e5e7eb; border-radius:12px;">
-      <div style="font-size:18px; font-weight:700;">{html.escape(council_name)}</div>
-      <div style="font-size:12px; color:#64748b; margin-top:2px;">Auto-drafted reply — please review before sending</div>
-      <hr style="border:none; border-top:1px solid #e5e7eb; margin:12px 0 16px 0;">
-      {helper_html if helper_html else "<p style='margin:0 0 10px 0;'>Based on your enquiry, these links should help:</p>"}
-      <ul style="margin:0 0 14px 18px; padding:0;">{lis or "<li>We’ll escalate this to the right team.</li>"}</ul>
-      <p style="margin:0 0 10px 0;">Your message:</p>
-      <blockquote style="margin:0; padding:12px 14px; background:#f8fafc; border-left:3px solid #0ea5e9; border-radius:6px;">{snippet}</blockquote>
-      <p style="margin:16px 0 0 0;">Kind regards,<br>Customer Service Team</p>
-    </td>
-  </tr>
-</table>
-"""
-    citations = [f"{x.get('title','Council page')} | {x.get('url','')}" for x in links[:MAX_LINKS]]
+    intro_block = (
+        ai_html
+        or response_html
+        or helper_html
+        or "<p style='margin:0 0 10px 0;'>Based on your enquiry, these links should help:</p>"
+    )
+
+    body = (
+        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+        "style=\"font-family: Arial, 'Segoe UI', sans-serif; color:#0f172a; line-height:1.55;\">"
+        "<tr><td style='padding:20px; border:1px solid #e5e7eb; border-radius:12px;'>"
+        "<div style='font-size:18px; font-weight:700;'>" + html.escape(council_name) + "</div>"
+        "<div style='font-size:12px; color:#64748b; margin-top:2px;'>Auto-drafted reply — please review before sending</div>"
+        "<hr style='border:none; border-top:1px solid #e5e7eb; margin:12px 0 16px 0;'>"
+        + intro_block +
+        "<ul style='margin:0 0 14px 18px; padding:0;'>" + (lis or "<li>We’ll escalate this to the right team.</li>") + "</ul>"
+        "<p style='margin:0 0 10px 0;'>Your message:</p>"
+        "<blockquote style='margin:0; padding:12px 14px; background:#f8fafc; border-left:3px solid #0ea5e9; border-radius:6px;'>"
+        + snippet + "</blockquote>"
+        "<p style='margin:16px 0 0 0;'>Kind regards,<br>Customer Service Team</p>"
+        "</td></tr></table>"
+    )
+
+    citations = [
+        (x.get("title", "Council page") + " | " + x.get("url", ""))
+        for x in links[:MAX_LINKS]
+    ]
     return body, citations
