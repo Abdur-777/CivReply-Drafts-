@@ -1,11 +1,18 @@
 # build_catalog.py — build catalog.json of key URLs per council (broad topics, no embeddings)
+# Py3.8/3.9 compatible type hints
 # Usage:
 #   python3 build_catalog.py
 #   python3 build_catalog.py --only "Wyndham City Council,City of Melbourne"
 
-import os, json, re, argparse, requests, time
+import os
+import json
+import re
+import argparse
+import requests
+import time
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from typing import Dict, List, Optional
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
@@ -14,7 +21,7 @@ HEADERS = {
 TIMEOUT = 18
 
 # Topic → candidate slug patterns (generic across VIC council sites) + scoring keywords
-TOPICS = {
+TOPICS: Dict[str, Dict[str, List[str]]] = {
     # Waste & recycling
     "waste": {
         "slugs": [
@@ -118,8 +125,8 @@ TOPICS = {
     },
     "building_permits": {
         "slugs": [
-            "/building-permits","/planning-building/building-permits","/building-and-development/building-permits",
-            "/planning-and-building/building","/building"
+            "/building-permits","/planning-building/building-permits",
+            "/building-and-development/building-permits","/planning-and-building/building","/building"
         ],
         "keywords": ["building","permit","surveyor","construction","demolition"]
     },
@@ -189,33 +196,44 @@ def fetch(url: str):
         if r.status_code != 200 or not r.text.strip():
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script","style","noscript","svg"]): t.decompose()
+        for t in soup(["script","style","noscript","svg"]):
+            t.decompose()
         title = (soup.title.string.strip() if soup.title else url)
         text = re.sub(r"\s+", " ", soup.get_text(" ").strip())
         return title, text[:20000]
     except Exception:
         return None, None
 
-def score(text: str, kws: list[str]) -> int:
-    if not text: return 0
+def score(text: Optional[str], kws: List[str]) -> int:
+    if not text:
+        return 0
     t = text.lower()
-    return sum(2 if (" " in k and k in t) else (1 if k in t else 0) for k in kws)
+    total = 0
+    for k in kws:
+        if " " in k and k in t:
+            total += 2
+        elif k in t:
+            total += 1
+    return total
 
-def best_url(base: str, topic: str, cfg: dict) -> dict | None:
-    tried = []
-    best = None
+def best_url(base: str, topic: str, cfg: Dict[str, List[str]]) -> Optional[Dict[str, str]]:
+    tried: List[str] = []
+    best: Optional[Dict[str, str]] = None
+    best_score = -1
     for slug in cfg["slugs"]:
         url = urljoin(base.rstrip("/") + "/", slug.lstrip("/"))
-        if url in tried: continue
+        if url in tried:
+            continue
         tried.append(url)
         title, text = fetch(url)
-        if not text: continue
+        if not text:
+            continue
         s = score(text, cfg["keywords"])
-        # tiny bias for pages that look like hours/contact where relevant
-        if topic in ("contact","libraries") and "hours" in text.lower():
+        if topic in ("contact", "libraries") and "hours" in text.lower():
             s += 3
-        if not best or s > best["score"]:
-            best = {"url": url, "title": title or url, "score": s}
+        if s > best_score:
+            best_score = s
+            best = {"url": url, "title": title or url}
     return best
 
 def normalize_base(base: str) -> str:
@@ -231,12 +249,12 @@ def main():
     args = ap.parse_args()
 
     councils = json.load(open("councils.json"))
-    names = list(councils.keys())
+    names: List[str] = list(councils.keys())
     if args.only:
         pick = {n.strip() for n in args.only.split(",")}
         names = [n for n in names if n in pick]
 
-    out = {}
+    out: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
     t0 = time.time()
     for name in names:
         base = normalize_base(councils[name])
@@ -249,7 +267,8 @@ def main():
                 print(f"  - {topic:22s} -> {info['url']}")
             else:
                 print(f"  - {topic:22s} -> (not found)")
-    json.dump(out, open(args.outfile, "w"), indent=2)
+    with open(args.outfile, "w") as f:
+        json.dump(out, f, indent=2)
     print(f"\nWrote {args.outfile} in {int(time.time()-t0)}s")
 
 if __name__ == "__main__":
