@@ -13,6 +13,6 @@ tiktoken>=0.7.0,<1.0.0
 numpy>=1.24.0,<2.0.0
 faiss-cpu>=1.7.4
 
-# --- Optional extras (enable retrieval via LangChain; safe to remove if unused) ---
+# 
 # langchain-openai>=0.1.7
 # langchain-community>=0.2.0
