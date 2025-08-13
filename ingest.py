@@ -46,8 +46,7 @@ FALLBACK_PATHS = [
 ]
 
 # --------- MANUAL SEEDS (major VIC councils) ----------
-# Use some domain-specific paths for tricky sites, otherwise generic service hubs.
-# Seeds can be relative (we'll urljoin) or absolute. BFS will expand from them.
+# Keys MUST be exact base URLs (one line each). Values are lists of path strings.
 MANUAL_SEEDS = {
     # Inner Melbourne
     "https://www.melbourne.vic.gov.au": [
@@ -93,8 +92,8 @@ MANUAL_SEEDS = {
         "/services/rubbish-waste-and-recycling",
         "/services/parking/permits",
         "/building-and-development/building-permits",
-        "/about-council/contact-us",
-        "/services/rates"
+        "/services/rates",
+        "/about-council/contact-us"
     ],
 
     # SE Metro
@@ -117,15 +116,15 @@ MANUAL_SEEDS = {
         "/services/rubbish-and-recycling",
         "/parking/permits",
         "/building-and-planning/building",
-        "/council/about-council/contact-us",
-        "/services/rates-and-valuations"
+        "/services/rates-and-valuations",
+        "/council/about-council/contact-us"
     ],
     "https://www.greaterdandenong.vic.gov.au": [
         "/services/rubbish-and-recycling",
         "/parking/permits",
         "/building-and-planning/building",
-        "/council/contact-us",
-        "/services/rates"
+        "/services/rates",
+        "/council/contact-us"
     ],
     "https://www.casey.vic.gov.au": [
         "/waste-recycling",
@@ -172,15 +171,15 @@ MANUAL_SEEDS = {
         "/services/Rubbish-and-recycling",
         "/services/Parking-and-roads/Parking-permits",
         "/services/Building-and-planning/Building-permits",
-        "/council/contact-us",
-        "/services/Rates-and-valuations"
+        "/services/Rates-and-valuations",
+        "/council/contact-us"
     ],
     "https://www.darebin.vic.gov.au": [
         "/services-and-payments/rubbish-and-recycling",
         "/services-and-payments/parking/permits",
         "/building-and-planning/building-permits",
-        "/council/contact-us",
-        "/council/rates"
+        "/council/rates",
+        "/council/contact-us"
     ],
     "https://www.whittlesea.vic.gov.au": [
         "/community-support/waste-and-recycling",
@@ -267,7 +266,7 @@ MANUAL_SEEDS = {
         "/Contact-us"
     ],
 
-    # North/West metro
+    # North/West metro extras
     "https://www.mvcc.vic.gov.au": [
         "/residents/rubbish-and-recycling",
         "/residents/parking/permits",
@@ -322,7 +321,7 @@ MANUAL_SEEDS = {
         "/waste",
         "/parking/permitting",
         "/building-and-planning/building",
-        "/council/ rates-and-valuations",
+        "/council/rates-and-valuations",
         "/community/libraries",
         "/council/contact-us"
     ],
