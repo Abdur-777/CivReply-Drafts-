@@ -1,17 +1,28 @@
 # build_catalog.py — build catalog.json of key URLs per council (broad topics, no embeddings)
-# Python 3.8+ compatible (no union types)
+# Python 3.8+ compatible
 
-import os, json, re, argparse, requests, time
+import os, json, re, argparse, time, sys
 from urllib.parse import urljoin
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-TIMEOUT = 18
+# ---------- Tuning ----------
+TIMEOUT = int(os.getenv("CATALOG_TIMEOUT", "18"))
+RATE_LIMIT_SEC = float(os.getenv("CATALOG_RATE_LIMIT_SEC", "0.4"))  # polite delay between requests
+RETRIES_TOTAL = int(os.getenv("CATALOG_RETRIES_TOTAL", "4"))
+RETRIES_BACKOFF = float(os.getenv("CATALOG_RETRIES_BACKOFF", "0.6"))
+SAVE_EVERY = int(os.getenv("CATALOG_SAVE_EVERY", "3"))  # write partial progress every N councils
 
-# Topic → candidate slug patterns + scoring keywords
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126 Safari/537.36 CivReplyCatalogBot/1.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+}
+
+# ---------- Topic patterns ----------
 TOPICS = {
     # Waste & recycling
     "waste": {
@@ -94,7 +105,7 @@ TOPICS = {
         "keywords": ["street tree","pruning","remove","permit","nature strip"]
     },
 
-    # Rates & revenue
+    # Rates
     "rates": {
         "slugs": [
             "/rates","/services/rates","/council/rates",
@@ -113,7 +124,7 @@ TOPICS = {
         "keywords": ["pet","dog","cat","registration","microchip","renew"]
     },
 
-    # Planning & building & local laws
+    # Planning & building
     "planning_permits": {
         "slugs": ["/planning-permits","/planning/apply","/planning-building/planning","/planning-and-building/planning"],
         "keywords": ["planning","permit","application","advertising","neighbor"]
@@ -130,7 +141,7 @@ TOPICS = {
         "keywords": ["local law","permit","trading","footpath","amplified"]
     },
 
-    # Community facilities & services
+    # Community services
     "libraries": {
         "slugs": ["/libraries","/library","/community/libraries","/residents/libraries","/Leisure-and-culture/Libraries","/Our-Community/Libraries"],
         "keywords": ["library","libraries","hours","borrowing","membership"]
@@ -185,21 +196,44 @@ TOPICS = {
     }
 }
 
-def fetch(url):
+# ---------- HTTP session with retries ----------
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(
+        total=RETRIES_TOTAL,
+        backoff_factor=RETRIES_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = make_session()
+
+def fetch(url: str):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        if r.status_code != 200 or not r.text.strip():
+        r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True)
+        if r.status_code != 200 or not r.text or not r.text.strip():
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script","style","noscript","svg"]): t.decompose()
-        title = (soup.title.string.strip() if soup.title else url)
+        for t in soup(["script","style","noscript","svg"]): 
+            t.decompose()
+        title = (soup.title.string.strip() if soup.title and soup.title.string else url)
         text = re.sub(r"\s+", " ", soup.get_text(" ").strip())
         return title, text[:20000]
     except Exception:
         return None, None
+    finally:
+        if RATE_LIMIT_SEC > 0:
+            time.sleep(RATE_LIMIT_SEC)
 
 def score(text, kws):
-    if not text: return 0
+    if not text: 
+        return 0
     t = text.lower()
     total = 0
     for k in kws:
@@ -209,16 +243,26 @@ def score(text, kws):
             total += 1
     return total
 
+def normalize_base(base):
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if not base.startswith("http"):
+        base = "https://" + base
+    return base
+
 def best_url(base, topic, cfg):
-    tried = []
+    tried = set()
     best = None
     best_score = -1
     for slug in cfg["slugs"]:
         url = urljoin(base.rstrip("/") + "/", slug.lstrip("/"))
-        if url in tried: continue
-        tried.append(url)
+        if url in tried: 
+            continue
+        tried.add(url)
         title, text = fetch(url)
-        if not text: continue
+        if not text:
+            continue
         s = score(text, cfg["keywords"])
         if topic in ("contact", "libraries") and "hours" in text.lower():
             s += 3
@@ -227,40 +271,99 @@ def best_url(base, topic, cfg):
             best = {"url": url, "title": title or url}
     return best
 
-def normalize_base(base):
-    base = base.strip().rstrip("/")
-    if not base.startswith("http"):
-        base = "https://" + base
-    return base
+def load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def maybe_write(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="", help="Comma-separated council names to build")
+    ap.add_argument("--only", default="", help="Comma-separated council names to build (exact match)")
     ap.add_argument("--outfile", default="catalog.json", help="Output file")
+    ap.add_argument("--overrides", default="overrides.json", help="Optional overrides file (topic->url per council)")
     args = ap.parse_args()
 
-    councils = json.load(open("councils.json"))
+    try:
+        councils = load_json("councils.json")
+    except Exception as e:
+        print("❌ Missing or invalid councils.json. Expected format: { 'Council Name': 'www.example.vic.gov.au', ... }")
+        print("Error:", e)
+        sys.exit(1)
+
+    overrides = {}
+    if os.path.exists(args.overrides):
+        try:
+            overrides = load_json(args.overrides)  # { "Council Name": { "topic": "https://..." } }
+            print(f"✓ Loaded overrides from {args.overrides}")
+        except Exception:
+            print(f"⚠️ Could not parse overrides file: {args.overrides}")
+
     names = list(councils.keys())
     if args.only:
-        pick = {n.strip() for n in args.only.split(",")}
+        pick = {n.strip() for n in args.only.split(",") if n.strip()}
         names = [n for n in names if n in pick]
 
     out = {}
     t0 = time.time()
-    for name in names:
+    failures = []
+
+    for i, name in enumerate(names, 1):
         base = normalize_base(councils[name])
+        if not base:
+            print(f"• {name}: (no base URL?) — skipped")
+            failures.append(name)
+            continue
+
         print(f"• {name}: {base}")
-        out[name] = {"base": base, "topics": {}}
-        for topic, cfg in TOPICS.items():
-            info = best_url(base, topic, cfg)
-            if info:
-                out[name]["topics"][topic] = {"url": info["url"], "title": info["title"]}
-                print(f"  - {topic:22s} -> {info['url']}")
-            else:
-                print(f"  - {topic:22s} -> (not found)")
-    with open(args.outfile, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"\nWrote {args.outfile} in {int(time.time()-t0)}s")
+
+        # Try HTTPS; if no topics found at all, retry once with http://
+        bases_to_try = [base]
+        if base.startswith("https://"):
+            bases_to_try.append("http://" + base[len("https://"):])
+
+        found_any = False
+        council_entry = {"base": base, "topics": {}}
+
+        # Apply any manual overrides first
+        ov = overrides.get(name, {})
+        for topic, url in (ov.items() if isinstance(ov, dict) else []):
+            council_entry["topics"][topic] = {"url": url, "title": url}
+            found_any = True
+            print(f"  - {topic:22s} -> (override) {url}")
+
+        for base_try in bases_to_try:
+            for topic, cfg in TOPICS.items():
+                if topic in council_entry["topics"]:
+                    continue  # already set via override
+                info = best_url(base_try, topic, cfg)
+                if info:
+                    council_entry["topics"][topic] = {"url": info["url"], "title": info["title"]}
+                    print(f"  - {topic:22s} -> {info['url']}")
+                    found_any = True
+
+            if found_any:
+                break  # no need to try the http:// fallback if we found some on https://
+
+        out[name] = council_entry
+        if not found_any:
+            failures.append(name)
+            print("  (no topics found)")
+
+        # Save partial progress every few councils
+        if i % SAVE_EVERY == 0:
+            maybe_write(args.outfile, out)
+            print(f"  …partial save → {args.outfile}")
+
+    maybe_write(args.outfile, out)
+    dt = int(time.time() - t0)
+    print(f"\nWrote {args.outfile} in {dt}s. Councils processed: {len(names)}. Failures: {len(failures)}")
+    if failures:
+        print("No topics found for:", ", ".join(failures))
 
 if __name__ == "__main__":
     main()
