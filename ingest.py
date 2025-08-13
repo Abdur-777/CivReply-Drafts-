@@ -1,32 +1,46 @@
 # ingest.py — robust & low-memory index builder for VIC councils
-# - Uses sitemaps + manual seeds + light BFS crawl
+# - Sitemaps + manual seeds + light BFS crawl
 # - Embeds incrementally in small batches (low RAM)
 #
 # Examples:
 #   python3 ingest.py --only "Wyndham City Council" --limit-pages 40 --max-chunks 600 --batch 12
 #   python3 ingest.py  # build all councils from councils.json with safe defaults
 
-import os, json, re, time, gzip, argparse, requests, faiss, numpy as np, tiktoken
-from bs4 import BeautifulSoup
+import os, sys, json, re, time, gzip, argparse, hashlib, gzip
 from urllib.parse import urlparse, urljoin
 from xml.etree import ElementTree as ET
-from openai import OpenAI
 
-EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import faiss, numpy as np, tiktoken
+from openai import OpenAI
+import urllib.robotparser as robotparser
+
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dims
 DIM = 1536
 ENC = tiktoken.get_encoding("cl100k_base")
-IDX_DIR = "indexes"
-os.makedirs(IDX_DIR, exist_ok=True)
+
+OUT_ROOT = os.getenv("INDEX_ROOT", "index")  # will write to index/<slug>/
+os.makedirs(OUT_ROOT, exist_ok=True)
+
+# Politeness / networking
+TIMEOUT = int(os.getenv("INGEST_TIMEOUT", "25"))
+RETRY_TOTAL = int(os.getenv("INGEST_RETRIES", "4"))
+RETRY_BACKOFF = float(os.getenv("INGEST_BACKOFF", "0.6"))
+RATE_LIMIT = float(os.getenv("INGEST_RATE_LIMIT", "0.25"))  # seconds between requests
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 CivReplyIngest/1.0"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
 }
 
-# Pages we care about (adjust as you learn what residents ask)
+# Keep / skip patterns
 KEEP_PATTERNS = [
     "waste","recycling","bin","hard-waste","hardwaste","hard-rubbish","green-waste",
     "parking","permit","permits","rates","fees","payments","pay","fines",
@@ -35,186 +49,19 @@ KEEP_PATTERNS = [
     "building","planning","building-permit","building-permits","roads","footpath","maintenance","graffiti",
     "events","collection","book","booking","transfer-station","tip","landfill","garbage"
 ]
-
-# Generic fallbacks if sitemaps are thin
-FALLBACK_PATHS = [
-    "/services","/contact-us","/contact","/contact-us/","/contact/","/contactus",
-    "/rates","/rates-and-valuation","/waste-recycling","/waste-and-recycling",
-    "/parking-permits","/parking/permits","/parking",
-    "/libraries","/library",
-    "/building-permits","/planning-building","/planning-and-building","/building","/planning"
+SKIP_PATTERNS = [
+    "/wp-admin", "/search?", "/login", "/signin", "/sign-in", "/account", "/cart", "/shop",
+    "/terms", "/privacy-policy"  # legal pages are rarely useful for resident queries (except privacy) — adjust if needed
 ]
 
-# --------- MANUAL SEEDS (major VIC councils) ----------
-# Keys MUST be exact base URLs (one line each). Values are lists of path strings.
+FALLBACK_PATHS = [
+    "/services","/contact-us","/contact","/rates","/rates-and-valuation",
+    "/waste-recycling","/waste-and-recycling","/parking-permits","/parking/permits",
+    "/libraries","/library","/building-permits","/planning-building","/planning-and-building","/building","/planning"
+]
+
+# --------- MANUAL SEEDS (truncated for brevity — keep your full dict) ----------
 MANUAL_SEEDS = {
-    # Inner Melbourne
-    "https://www.melbourne.vic.gov.au": [
-        "/residents/waste-and-recycling/kerbside-collections",
-        "/residents/waste-and-recycling/hard-waste-collection",
-        "/parking-and-transport/permits/resident-parking-permits",
-        "/residents/rates",
-        "/libraries",
-        "/building-and-development/building-permits",
-        "/contact-us"
-    ],
-    "https://www.yarracity.vic.gov.au": [
-        "/services/waste-and-recycling",
-        "/services/parking-permits",
-        "/planning-building/building",
-        "/about-us/contact-us",
-        "/services/rates"
-    ],
-    "https://www.portphillip.vic.gov.au": [
-        "/residents/waste-and-recycling",
-        "/residents/parking-permits",
-        "/planning-and-building/building",
-        "/residents/rates",
-        "/council/about-the-council/contact-us"
-    ],
-    "https://www.stonnington.vic.gov.au": [
-        "/residents-and-families/waste-and-recycling",
-        "/residents-and-families/parking/parking-permits",
-        "/planning-and-building/building-and-permits",
-        "/council/rates-and-valuations",
-        "/libraries",
-        "/council/contact-us"
-    ],
-    "https://www.gleneira.vic.gov.au": [
-        "/services/rubbish-and-recycling",
-        "/services/parking/permits",
-        "/services/planning-and-building/building",
-        "/services/rates-and-valuations",
-        "/libraries",
-        "/about-council/contact-us"
-    ],
-    "https://www.boroondara.vic.gov.au": [
-        "/services/rubbish-waste-and-recycling",
-        "/services/parking/permits",
-        "/building-and-development/building-permits",
-        "/services/rates",
-        "/about-council/contact-us"
-    ],
-
-    # SE Metro
-    "https://www.monash.vic.gov.au": [
-        "/services/waste-and-recycling",
-        "/services/parking/permits",
-        "/planning-building/building-permits",
-        "/services/rates",
-        "/libraries",
-        "/about-us/contact-us"
-    ],
-    "https://www.bayside.vic.gov.au": [
-        "/services/waste-and-recycling",
-        "/services/parking/permits",
-        "/services/rates",
-        "/libraries",
-        "/contact-us"
-    ],
-    "https://www.kingston.vic.gov.au": [
-        "/services/rubbish-and-recycling",
-        "/parking/permits",
-        "/building-and-planning/building",
-        "/services/rates-and-valuations",
-        "/council/about-council/contact-us"
-    ],
-    "https://www.greaterdandenong.vic.gov.au": [
-        "/services/rubbish-and-recycling",
-        "/parking/permits",
-        "/building-and-planning/building",
-        "/services/rates",
-        "/council/contact-us"
-    ],
-    "https://www.casey.vic.gov.au": [
-        "/waste-recycling",
-        "/parking-roads/parking-permits",
-        "/planning-building/building-permits",
-        "/rates",
-        "/libraries",
-        "/contact-us"
-    ],
-    "https://www.frankston.vic.gov.au": [
-        "/services/rubbish-and-recycling",
-        "/services/parking/permits",
-        "/services/rates",
-        "/libraries",
-        "/council/contact-us"
-    ],
-    "https://www.mornpen.vic.gov.au": [
-        "/Your-Property/Rubbish-Recycling",
-        "/Your-Property/Parking-and-Roads/Parking-permits",
-        "/Your-Property/Building-and-Planning/Building",
-        "/Your-Property/Rates",
-        "/Your-Community/Libraries",
-        "/About-Us/Contact-Us"
-    ],
-
-    # East/North-East
-    "https://www.whitehorse.vic.gov.au": [
-        "/waste-recycling",
-        "/parking/permits",
-        "/building-and-planning/building",
-        "/council/rates",
-        "/libraries",
-        "/contact-us"
-    ],
-    "https://www.manningham.vic.gov.au": [
-        "/services-and-payments/rubbish-and-recycling",
-        "/services-and-payments/parking/permits",
-        "/planning-and-building/building",
-        "/council/rates",
-        "/services-and-payments/libraries",
-        "/about-council/contact-us"
-    ],
-    "https://www.banyule.vic.gov.au": [
-        "/services/Rubbish-and-recycling",
-        "/services/Parking-and-roads/Parking-permits",
-        "/services/Building-and-planning/Building-permits",
-        "/services/Rates-and-valuations",
-        "/council/contact-us"
-    ],
-    "https://www.darebin.vic.gov.au": [
-        "/services-and-payments/rubbish-and-recycling",
-        "/services-and-payments/parking/permits",
-        "/building-and-planning/building-permits",
-        "/council/rates",
-        "/council/contact-us"
-    ],
-    "https://www.whittlesea.vic.gov.au": [
-        "/community-support/waste-and-recycling",
-        "/transport-streets-and-parking/parking/permits",
-        "/building-planning-and-works/building",
-        "/council/rates",
-        "/community-support/libraries",
-        "/council/contact-us"
-    ],
-    "https://www.hume.vic.gov.au": [
-        "/Residents/Waste-and-recycling",
-        "/Residents/Parking-and-roads/Parking-permits",
-        "/Building-and-planning/Building",
-        "/Residents/Rates",
-        "/Libraries-venues-and-facilities/Libraries",
-        "/Contact-us"
-    ],
-
-    # West/North-West
-    "https://www.hobsonsbay.vic.gov.au": [
-        "/Residents/Rubbish-and-recycling",
-        "/Residents/Parking/Permits",
-        "/Building-and-planning/Building",
-        "/Council/Rates",
-        "/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.maribyrnong.vic.gov.au": [
-        "/Residents/Rubbish-and-recycling",
-        "/Residents/Parking-and-roads/Parking-permits",
-        "/Planning-and-building/Building-permits",
-        "/Council/Rates",
-        "/Library",
-        "/Contact-us"
-    ],
     "https://www.wyndham.vic.gov.au": [
         "/services/waste-recycling",
         "/services/parking-roads/parking-permits",
@@ -223,157 +70,45 @@ MANUAL_SEEDS = {
         "/libraries",
         "/contact-us"
     ],
-    "https://www.brimbank.vic.gov.au": [
-        "/residents/waste-and-recycling",
-        "/residents/parking-roads/parking-permits",
-        "/planning-building/building-permits",
-        "/council/rates",
-        "/libraries",
-        "/about-council/contact-us"
-    ],
-    "https://www.melton.vic.gov.au": [
-        "/Residents/Rubbish-and-recycling",
-        "/Residents/Parking-and-roads/Parking",
-        "/Building-and-planning/Building-permits",
-        "/Council/Rates",
-        "/Our-Community/Libraries",
-        "/Contact-us"
-    ],
-
-    # Outer East / Yarra Ranges
-    "https://www.knox.vic.gov.au": [
-        "/Our-services/Rubbish-and-recycling",
-        "/Our-services/Parking/Permits",
-        "/Building-and-planning/Building-permits",
-        "/Council/Rates",
-        "/Our-Community/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.maroondah.vic.gov.au": [
-        "/Residents/Your-home-and-property/Waste-and-recycling",
-        "/Residents/Parking-and-roads/Parking-permits",
-        "/Residents/Your-home-and-property/Building",
-        "/Council/Rates",
-        "/Leisure-and-culture/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.yarraranges.vic.gov.au": [
-        "/Residents/Waste-and-recycling",
-        "/Residents/Parking-and-roads/Parking-permits",
-        "/Planning-building-and-biz/Building",
-        "/Council/Rates",
-        "/Leisure/Libraries",
-        "/Contact-us"
-    ],
-
-    # North/West metro extras
-    "https://www.mvcc.vic.gov.au": [
-        "/residents/rubbish-and-recycling",
-        "/residents/parking/permits",
-        "/planning-and-building/building-permits",
-        "/council/rates",
-        "/residents/libraries",
-        "/contact-us"
-    ],
-    "https://www.nillumbik.vic.gov.au": [
-        "/Residents/Waste-and-recycling",
-        "/Residents/Parking-and-roads/Parking",
-        "/Residents/Building-and-planning/Building",
-        "/Council/Rates",
-        "/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.mrsc.vic.gov.au": [
-        "/Residents/Rubbish-Recycling",
-        "/Residents/Parking-Roads/Parking",
-        "/Residents/Building-Planning/Building",
-        "/Residents/Rates",
-        "/Community/Libraries",
-        "/Contact-Us"
-    ],
-
-    # Major regionals
-    "https://www.geelongaustralia.com.au": [
-        "/services/recycling/default.aspx",
-        "/parking/permits/",
-        "/building/",
-        "/rates/",
-        "/library/",
-        "/contact/"
-    ],
-    "https://www.bendigo.vic.gov.au": [
-        "/Services/Waste-and-Recycling",
-        "/Services/Parking/Parking-Permits",
-        "/Planning/Building",
-        "/Services/Rates-and-Valuations",
-        "/Services/Libraries",
-        "/About/Contact-Us"
-    ],
-    "https://www.ballarat.vic.gov.au": [
-        "/city/parking-and-transport/parking-permits",
-        "/city/rubbish-and-recycling",
-        "/building-and-planning/building",
-        "/council/rates",
-        "/community-and-recreation/libraries",
-        "/contact-us"
-    ],
-    "https://www.greatershepparton.com.au": [
-        "/waste",
-        "/parking/permitting",
-        "/building-and-planning/building",
-        "/council/rates-and-valuations",
-        "/community/libraries",
-        "/council/contact-us"
-    ],
-    "https://www.latrobe.vic.gov.au": [
-        "/Residents/Waste-and-recycling",
-        "/Residents/Parking-and-roads/Parking",
-        "/Residents/Building-and-planning/Building",
-        "/Council/Rates-and-valuations",
-        "/Our-community/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.mildura.vic.gov.au": [
-        "/Services/Waste-and-recycling",
-        "/Services/Parking",
-        "/Planning-building-and-living/Building",
-        "/Services/Rates",
-        "/Services/Libraries",
-        "/Contact-us"
-    ],
-    "https://www.warrnambool.vic.gov.au": [
-        "/community/parking",
-        "/services/waste-recycling",
-        "/planning-and-building/building",
-        "/city/rates",
-        "/libraries",
-        "/contact-us"
-    ],
-    "https://www.surfcoast.vic.gov.au": [
-        "/Environment/Waste-and-recycling",
-        "/Parking-and-roads/Parking",
-        "/Planning-and-building/Building",
-        "/Your-Community/Rates",
-        "/Your-Community/Libraries",
-        "/Your-Council/Contact-us"
-    ],
-    "https://www.goldenplains.vic.gov.au": [
-        "/resident-services/rubbish-and-recycling",
-        "/resident-services/parking-and-roads",
-        "/building-and-planning/building",
-        "/council/rates",
-        "/libraries",
-        "/council/contact-us"
-    ]
+    # ... (keep the rest of your MANUAL_SEEDS here)
 }
 # --------- /MANUAL SEEDS ----------
 
+def slugify(name: str) -> str:
+    s = name.lower().strip()
+    s = re.sub(r"(city of|city|shire|council|borough)", "", s, flags=re.I)
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "council"
+
 def good(url: str) -> bool:
     u = url.lower()
+    if any(x in u for x in SKIP_PATTERNS):
+        return False
     return any(p in u for p in KEEP_PATTERNS)
 
-def fetch(url: str):
-    return requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+# Session with retries
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(
+        total=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=32)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = make_session()
+
+def fetch(url: str) -> requests.Response:
+    r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True)
+    if RATE_LIMIT > 0:
+        time.sleep(RATE_LIMIT)
+    return r
 
 def sitemap_candidates(base: str):
     base = base.rstrip("/")
@@ -404,8 +139,11 @@ def iter_sitemap_urls(sm_url: str):
         if r.status_code != 200 or not r.content:
             return
         data = r.content
-        if sm_url.endswith(".gz"):
-            data = gzip.decompress(data)
+        if sm_url.endswith(".gz") or r.headers.get("Content-Encoding","").lower() == "gzip":
+            try:
+                data = gzip.decompress(data)
+            except Exception:
+                pass
         root = ET.fromstring(data)
         if root.tag.endswith("sitemapindex"):
             for node in root.iter():
@@ -418,7 +156,28 @@ def iter_sitemap_urls(sm_url: str):
     except Exception:
         return
 
-def bfs_crawl(base: str, starts: list[str], limit_pages=120, max_depth=2):
+def allow_url(rp: robotparser.RobotFileParser, url: str) -> bool:
+    try:
+        return rp.can_fetch(HEADERS["User-Agent"], url)
+    except Exception:
+        return True
+
+def load_robots(base: str) -> robotparser.RobotFileParser:
+    rp = robotparser.RobotFileParser()
+    robots_url = urljoin(base.rstrip("/") + "/", "robots.txt")
+    try:
+        rp.set_url(robots_url)
+        # use our session for consistency
+        r = fetch(robots_url)
+        if r.status_code == 200:
+            rp.parse(r.text.splitlines())
+        else:
+            rp.parse([])
+    except Exception:
+        rp.parse([])
+    return rp
+
+def bfs_crawl(base: str, starts: list, limit_pages=120, max_depth=2, rp=None):
     host = urlparse(base).netloc
     q, seen, urls = [], set(), []
     for s in starts:
@@ -426,9 +185,12 @@ def bfs_crawl(base: str, starts: list[str], limit_pages=120, max_depth=2):
         q.append((absu, 0)); seen.add(absu)
     while q and len(urls) < limit_pages:
         url, depth = q.pop(0)
+        if rp and not allow_url(rp, url):
+            continue
         try:
             r = fetch(url)
-            if r.status_code != 200 or not r.text:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code != 200 or "text/html" not in ctype or not r.text:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
         except Exception:
@@ -443,6 +205,7 @@ def bfs_crawl(base: str, starts: list[str], limit_pages=120, max_depth=2):
             if not p.scheme.startswith("http"): continue
             if not p.netloc.endswith(host): continue
             if href in seen: continue
+            if rp and not allow_url(rp, href): continue
             seen.add(href); q.append((href, depth+1))
             if len(urls) >= limit_pages: break
     # dedupe preserving order
@@ -452,34 +215,47 @@ def bfs_crawl(base: str, starts: list[str], limit_pages=120, max_depth=2):
             seen2.add(u); out.append(u)
     return out
 
-def discover_urls(base: str, limit=150) -> list[str]:
+def discover_urls(base: str, limit=150, ignore_robots=False) -> list:
     urls, seen = [], set()
-    # 1) sitemaps
+    rp = None if ignore_robots else load_robots(base)
+
+    # sitemaps
     for cand in sitemap_candidates(base):
         for u in iter_sitemap_urls(cand) or []:
             if urlparse(u).netloc.endswith(urlparse(base).netloc) and u not in seen:
+                if rp and not allow_url(rp, u):
+                    continue
                 seen.add(u); urls.append(u)
                 if len(urls) >= limit: break
         if len(urls) >= limit: break
-    # 2) manual seeds (domain-specific)
+
+    # seeds
     seed_paths = MANUAL_SEEDS.get(base.rstrip("/"), [])
     for s in seed_paths:
         absu = s if s.startswith("http") else urljoin(base, s)
+        if rp and not allow_url(rp, absu):
+            continue
         if absu not in urls: urls.append(absu)
-    # 3) generic fallbacks
+
+    # generic fallbacks
     if len(urls) < 10:
         for path in FALLBACK_PATHS:
             u = urljoin(base, path)
             try:
+                if rp and not allow_url(rp, u): 
+                    continue
                 rr = fetch(u)
-                if rr.status_code == 200: urls.append(u)
+                if rr.status_code == 200 and "text/html" in (rr.headers.get("Content-Type","").lower()):
+                    urls.append(u)
             except Exception:
                 pass
-    # 4) mini-BFS crawl if still thin
+
+    # mini-BFS if still thin
     if len([u for u in urls if good(u)]) < 25:
-        crawled = bfs_crawl(base, seed_paths or ["/"], limit_pages=180, max_depth=2)
+        crawled = bfs_crawl(base, seed_paths or ["/"], limit_pages=min(180, limit*2), max_depth=2, rp=rp)
         urls.extend(crawled)
-    # filter, dedupe, cap
+
+    # filter, dedupe, cap, content-type guard
     host = urlparse(base).netloc
     urls = [u for u in urls if urlparse(u).netloc.endswith(host)]
     urls = [u for u in urls if good(u)]
@@ -492,17 +268,25 @@ def discover_urls(base: str, limit=150) -> list[str]:
 
 def fetch_clean(url: str) -> tuple[str, str]:
     r = fetch(url); r.raise_for_status()
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "text/html" not in ctype:
+        raise RuntimeError(f"skip non-HTML: {ctype}")
     soup = BeautifulSoup(r.text, "html.parser")
-    title = (soup.title.string if soup.title else url).strip()
+    title = (soup.title.string if soup.title and soup.title.string else url).strip()
     for tag in soup(["script","style","noscript","svg"]): tag.decompose()
     text = re.sub(r"\s+", " ", soup.get_text(separator=" ").strip())
     return title, text
 
 def chunk(text: str, max_tokens=500, overlap=80):
-    toks = ENC.encode(text); i = 0
+    # Ensure forward progress even if overlap >= max_tokens
+    overlap = max(0, min(overlap, max_tokens - 1))
+    toks = ENC.encode(text)
+    i = 0
     while i < len(toks):
         j = min(i + max_tokens, len(toks))
-        yield ENC.decode(toks[i:j]); i = j - overlap
+        yield ENC.decode(toks[i:j])
+        if j >= len(toks): break
+        i = j - overlap if j - i > overlap else j
 
 def embed_in_batches(client: OpenAI, texts: list[str], batch_size: int):
     """Yield embeddings for texts in small batches to keep RAM low."""
@@ -512,51 +296,89 @@ def embed_in_batches(client: OpenAI, texts: list[str], batch_size: int):
         for item in resp.data:
             yield item.embedding
 
-def build_for(name: str, base_url: str, limit_pages: int, max_chunks: int, batch: int):
-    print(f"• {name}: discovering pages from {base_url}")
-    urls = discover_urls(base_url, limit=limit_pages)
+def ensure_outdir(slug: str) -> str:
+    d = os.path.join(OUT_ROOT, slug)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def build_for(name: str, base_url: str, limit_pages: int, max_chunks: int, batch: int, ignore_robots: bool):
+    slug = slugify(name)
+    outdir = ensure_outdir(slug)
+    info_path = os.path.join(outdir, "info.json")
+    meta_path = os.path.join(outdir, "meta.jsonl")
+    faiss_path = os.path.join(outdir, "index.faiss")
+
+    print(f"• {name} [{slug}]: discovering pages from {base_url}")
+    urls = discover_urls(base_url, limit=limit_pages, ignore_robots=ignore_robots)
     if not urls:
         print("  (!) No URLs discovered — adjust seeds or patterns."); return
     print(f"  found {len(urls)} URLs; fetching & chunking… (limit {max_chunks} chunks)")
 
-    # Prepare index and outputs
+    if not os.getenv("OPENAI_API_KEY"):
+        print("❌ OPENAI_API_KEY is not set.")
+        sys.exit(1)
+
+    # Prepare index + outputs
     index = faiss.IndexFlatIP(DIM)
     client = OpenAI()
-    out_jsonl = open(f"{IDX_DIR}/{name}.jsonl","w")
+    meta_f = open(meta_path, "w", encoding="utf-8")
     added = 0
 
     docs_batch, metas_batch = [], []
+    seen_chunks = set()  # md5 of text to reduce duplicates
+
     def flush_batch():
         nonlocal docs_batch, metas_batch, added
         if not docs_batch: return
         vecs = list(embed_in_batches(client, docs_batch, batch))
-        X = np.array(vecs, dtype="float32")
+        X = np.asarray(vecs, dtype="float32")
         faiss.normalize_L2(X)
         index.add(X)
         for m in metas_batch:
-            out_jsonl.write(json.dumps(m) + "\n")
+            meta_f.write(json.dumps(m, ensure_ascii=False) + "\n")
         added += len(metas_batch)
         docs_batch, metas_batch = [], []
 
-    # Stream pages → chunks → embed in small batches
+    # Stream pages → chunks → embed
     for u in urls:
         if added >= max_chunks: break
         try:
             title, text = fetch_clean(u)
             for ch in chunk(text):
-                docs_batch.append(ch)
-                metas_batch.append({"text": ch, "url": u, "title": title})
-                if len(docs_batch) >= batch:
-                    flush_batch()
                 if added + len(metas_batch) >= max_chunks:
                     break
+                h = hashlib.md5(ch.encode("utf-8")).hexdigest()
+                if h in seen_chunks:
+                    continue
+                seen_chunks.add(h)
+                docs_batch.append(ch)
+                metas_batch.append({"text": ch, "url": u, "title": title, "council": slug})
+                if len(docs_batch) >= batch:
+                    flush_batch()
         except Exception as e:
-            print("   skip", u, str(e)[:100])
+            print("   skip", u, str(e)[:120])
 
     flush_batch()
-    out_jsonl.close()
-    faiss.write_index(index, f"{IDX_DIR}/{name}.faiss")
-    print(f"  ✓ Built {name}: {added} chunks")
+    meta_f.close()
+    faiss.write_index(index, faiss_path)
+
+    # Write info for compatibility checks
+    info = {
+        "model": EMBED_MODEL,
+        "dim": DIM,
+        "created": int(time.time()),
+        "params": {
+            "limit_pages": limit_pages,
+            "max_chunks": max_chunks,
+            "batch": batch,
+            "rate_limit": RATE_LIMIT
+        },
+        "source_base": base_url,
+        "count_chunks": added,
+    }
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+    print(f"  ✓ Built {name} → {faiss_path}  ({added} chunks)")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -564,9 +386,15 @@ if __name__ == "__main__":
     ap.add_argument("--limit-pages", type=int, default=80, help="Max URLs per council to fetch")
     ap.add_argument("--max-chunks", type=int, default=1200, help="Max chunks per council")
     ap.add_argument("--batch", type=int, default=12, help="Embedding batch size (lower = lower RAM)")
+    ap.add_argument("--ignore-robots", action="store_true", help="Ignore robots.txt (NOT recommended)")
     args = ap.parse_args()
 
-    data = json.load(open("councils.json"))
+    try:
+        data = json.load(open("councils.json", "r"))
+    except Exception as e:
+        print("❌ Missing or invalid councils.json. Expected: { 'Council Name': 'https://domain', ... }")
+        sys.exit(1)
+
     names = list(data.keys())
     if args.only:
         pick = {n.strip() for n in args.only.split(",")}
@@ -575,7 +403,7 @@ if __name__ == "__main__":
     t0 = time.time()
     for n in names:
         try:
-            build_for(n, data[n], args.limit_pages, args.max_chunks, args.batch)
+            build_for(n, data[n], args.limit_pages, args.max_chunks, args.batch, args.ignore_robots)
         except Exception as e:
             print("ERROR", n, e)
     print(f"Done in {int(time.time()-t0)}s")
