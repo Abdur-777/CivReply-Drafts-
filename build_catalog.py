@@ -1,18 +1,9 @@
 # build_catalog.py — build catalog.json of key URLs per council (broad topics, no embeddings)
-# Py3.8/3.9 compatible type hints
-# Usage:
-#   python3 build_catalog.py
-#   python3 build_catalog.py --only "Wyndham City Council,City of Melbourne"
+# Python 3.8+ compatible (no union types)
 
-import os
-import json
-import re
-import argparse
-import requests
-import time
+import os, json, re, argparse, requests, time
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from typing import Dict, List, Optional
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
@@ -20,8 +11,8 @@ HEADERS = {
 }
 TIMEOUT = 18
 
-# Topic → candidate slug patterns (generic across VIC council sites) + scoring keywords
-TOPICS: Dict[str, Dict[str, List[str]]] = {
+# Topic → candidate slug patterns + scoring keywords
+TOPICS = {
     # Waste & recycling
     "waste": {
         "slugs": [
@@ -41,13 +32,15 @@ TOPICS: Dict[str, Dict[str, List[str]]] = {
     },
     "hard_rubbish": {
         "slugs": [
-            "/hard-waste","/hard-rubbish","/waste-recycling/hard","/residents/waste-and-recycling/hard-waste-collection"
+            "/hard-waste","/hard-rubbish","/waste-recycling/hard",
+            "/residents/waste-and-recycling/hard-waste-collection"
         ],
         "keywords": ["hard waste","hard rubbish","bulky","book","collection","mattress"]
     },
     "green_waste": {
         "slugs": [
-            "/green-waste","/garden-waste","/organics","/waste-recycling/green","/kerbside-collections"
+            "/green-waste","/garden-waste","/organics",
+            "/waste-recycling/green","/kerbside-collections"
         ],
         "keywords": ["green","garden","organics","FOGO","bin","collection"]
     },
@@ -75,7 +68,8 @@ TOPICS: Dict[str, Dict[str, List[str]]] = {
     # Parking & roads
     "parking_permits": {
         "slugs": [
-            "/parking-permits","/parking/permits","/residents/parking-permits","/transport/parking/permits"
+            "/parking-permits","/parking/permits",
+            "/residents/parking-permits","/transport/parking/permits"
         ],
         "keywords": ["parking","permit","resident","visitor","zone","apply","renew"]
     },
@@ -103,7 +97,8 @@ TOPICS: Dict[str, Dict[str, List[str]]] = {
     # Rates & revenue
     "rates": {
         "slugs": [
-            "/rates","/services/rates","/council/rates","/services/rates-and-valuations","/rates-and-valuation","/rates-and-valuations"
+            "/rates","/services/rates","/council/rates",
+            "/services/rates-and-valuations","/rates-and-valuation","/rates-and-valuations"
         ],
         "keywords": ["rates","valuation","instalment","due","BPAY","notice"]
     },
@@ -190,23 +185,21 @@ TOPICS: Dict[str, Dict[str, List[str]]] = {
     }
 }
 
-def fetch(url: str):
+def fetch(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
         if r.status_code != 200 or not r.text.strip():
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script","style","noscript","svg"]):
-            t.decompose()
+        for t in soup(["script","style","noscript","svg"]): t.decompose()
         title = (soup.title.string.strip() if soup.title else url)
         text = re.sub(r"\s+", " ", soup.get_text(" ").strip())
         return title, text[:20000]
     except Exception:
         return None, None
 
-def score(text: Optional[str], kws: List[str]) -> int:
-    if not text:
-        return 0
+def score(text, kws):
+    if not text: return 0
     t = text.lower()
     total = 0
     for k in kws:
@@ -216,18 +209,16 @@ def score(text: Optional[str], kws: List[str]) -> int:
             total += 1
     return total
 
-def best_url(base: str, topic: str, cfg: Dict[str, List[str]]) -> Optional[Dict[str, str]]:
-    tried: List[str] = []
-    best: Optional[Dict[str, str]] = None
+def best_url(base, topic, cfg):
+    tried = []
+    best = None
     best_score = -1
     for slug in cfg["slugs"]:
         url = urljoin(base.rstrip("/") + "/", slug.lstrip("/"))
-        if url in tried:
-            continue
+        if url in tried: continue
         tried.append(url)
         title, text = fetch(url)
-        if not text:
-            continue
+        if not text: continue
         s = score(text, cfg["keywords"])
         if topic in ("contact", "libraries") and "hours" in text.lower():
             s += 3
@@ -236,7 +227,7 @@ def best_url(base: str, topic: str, cfg: Dict[str, List[str]]) -> Optional[Dict[
             best = {"url": url, "title": title or url}
     return best
 
-def normalize_base(base: str) -> str:
+def normalize_base(base):
     base = base.strip().rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
@@ -249,12 +240,12 @@ def main():
     args = ap.parse_args()
 
     councils = json.load(open("councils.json"))
-    names: List[str] = list(councils.keys())
+    names = list(councils.keys())
     if args.only:
         pick = {n.strip() for n in args.only.split(",")}
         names = [n for n in names if n in pick]
 
-    out: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
+    out = {}
     t0 = time.time()
     for name in names:
         base = normalize_base(councils[name])
